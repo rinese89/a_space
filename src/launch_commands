@@ -1,0 +1,108 @@
+
+
+
+++++ Launch System ++++
+
+$ ros2 launch aspace_bringup_pkg aspace_bringup.launch.py
+
+++++ Launch UAS ++++
+
+----- Grupo 1º -----
+$ ros2 launch uas_bringup_pkg uas_bringup.launch.py num_uas:=2 start_id:=1
+
+----- Grupo 2º -----
+$ ros2 launch uas_bringup_pkg uas_bringup.launch.py num_uas:=2 start_id:=3 start_agent:=false start_bridge:=false
+
+
+############################ TEST ###############################
+
+
+-------------------- Launch A-space ----------------------------------------
+
+$ ros2 launch aspace_bringup_pkg aspace_bringup.launch.py
+
+
+---------------- Launch Volumen Flight Zones -------------------------------
+
+$ ros2 launch flight_zone_manager flight_zone_server.launch.py
+
+
+---------------- Launch Monitor Flight Zones -------------------------------
+
+$ ros2 launch flight_zone_manager zone_volume_monitor.launch.py
+
+
+---------------------- Spanw UAs -------------------------------------------
+
+$ ros2 launch uas_bringup_pkg uas_bringup.launch.py
+
+
+---------------- Launch Controller Waypoints -------------------------------
+
+$ ros2 launch controllers_pkg control_waypoints.launch.py
+
+
+---------------------- Mission Manager -------------------------------------
+
+$ ros2 launch flight_zone_manager flight_zone_mission_manager.launch.py
+
+
+------------------------ MANUAL Manager--------------------------------------
+
+---------------------- Call Service -----------------------------------------
+
+$ ros2 service call /test/ua_1/arm_takeoff controllers_pkg/srv/ArmTakeoff "z: 4.0"
+
+
+--------------------- Send Goal Action ----------------------------------------
+
+$ ros2 action send_goal /test/ua_1/follow_waypoints controllers_pkg/action/FollowWaypoints "x: [0,4,4,0,0]
+y: [-4,-4,0,0,-4]
+height: 8.0
+goal_tolerance: 0.1
+slowdown_radius: 0.2
+repetitions: 1"
+
+
+############################ PUERTO ###############################
+
+------------- Launch A-space + Flight_zone_server + Zone_volume_monitor --------------
+
+$ ros2 launch aspace_bringup_pkg port_environment.launch.py
+
+
+---------------------- Spanw UAs -------------------------------------------
+
+$ ros2 launch uas_bringup_pkg port_uas_bringup.launch.py
+
+
+---------------------- Launch Trajectories -------------------------------------------
+
+$ ros2 launch mission_trajectory_validator mission_trajectory_validator.launch.py
+
+
+---------------------- Launch Supervisor Controlled Invasion -------------------------------------------
+
+$ros2 launch controlled_invasion_supervisor controlled_invasion_supervisor.launch.py
+
+
+---------------- Launch Controller Waypoints -------------------------------
+
+$ ros2 launch controllers_pkg port_control_waypoints.launch.py
+
+
+---------------------- Mission Manager -------------------------------------
+
+-------- Inspection ---
+
+$ ros2 launch flight_zone_manager flight_zone_mission_manager.launch.py config_file:=/home/rinese/a_space_ws/install/flight_zone_manager/share/flight_zone_manager/config/flight_zone_mission_manager_inspection.yaml
+
+-------- Logistics ----
+
+$ ros2 launch flight_zone_manager flight_zone_mission_manager.launch.py config_file:=/home/rinese/a_space_ws/install/flight_zone_manager/share/flight_zone_manager/config/flight_zone_mission_manager_logistics.yaml
+
+-------- Survillance --
+
+$ ros2 launch flight_zone_manager flight_zone_mission_manager.launch.py config_file:=/home/rinese/a_space_ws/install/flight_zone_manager/share/flight_zone_manager/config/flight_zone_mission_manager_survillance.yaml
+
+

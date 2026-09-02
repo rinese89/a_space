@@ -1,0 +1,208 @@
+static_trajectory_manager:
+  frame_id: map
+
+  # Mission containment is checked at these spatial increments.
+  flight_zone_validation_step_m: 0.25
+  flight_zone_boundary_tolerance_m: 0.03
+  flight_zone_boundary_is_inside: true
+
+  marker_line_width: 0.12
+  marker_text_height: 0.32
+
+  trajectories:
+    - trajectory_id: inspection_ua_ins_1
+      priority: 1
+      ua_id: 1
+      uas_namespace: ua_ins_1
+      flight_zone_id: inspection_1
+      action_name: /inspection_1/ua_ins_1/follow_waypoints
+
+      goal_tolerance: 0.12
+      slowdown_radius: 0.20
+
+      # Partial repetition: only the mission segment is repeated.
+      # repetitions: 1 => mission flown once.
+      repetitions: 1
+
+      # Total repetition period in seconds.
+      # 0.0 disables complete takeoff-mission-landing repetition.
+      operation_frequency: 120.0
+
+      # Used to estimate operation_end_utc from total geometric distance.
+      average_speed_mps: 2.0
+
+      # Only temporal datum supplied by the operator.
+      operation_start_utc: "2026-09-02T22:00:00Z"
+
+      takeoff:
+        x: [3.0, 3.0]
+        y: [3.0, 3.0]
+        z: [0.0, 3.0]
+
+      mission:
+        x: [3.0, 7.0, 7.0, 3.0, 3.0]
+        y: [3.0, 3.0, 7.0, 7.0, 3.0]
+        height: 3.0
+
+      landing:
+        x: [3.0, 3.0]
+        y: [3.0, 3.0]
+        z: [3.0, 0.0]
+    
+
+    - trajectory_id: inspection_ua_ins_2
+      priority: 2
+      ua_id: 2
+      uas_namespace: ua_ins_2
+      flight_zone_id: inspection_1
+      action_name: /inspection_1/ua_ins_2/follow_waypoints
+
+      goal_tolerance: 0.12
+      slowdown_radius: 0.20
+
+      # Partial repetition: only the mission segment is repeated.
+      # repetitions: 1 => mission flown once.
+      repetitions: 1
+
+      # Total repetition period in seconds.
+      # 0.0 disables complete takeoff-mission-landing repetition.
+      operation_frequency: 120.0
+
+      # Used to estimate operation_end_utc from total geometric distance.
+      average_speed_mps: 2.0
+
+      # Only temporal datum supplied by the operator.
+      operation_start_utc: "2026-09-02T22:00:00Z"
+
+      takeoff:
+        x: [6.0, 6.0]
+        y: [3.0, 3.0]
+        z: [0.0, 3.0]
+
+      mission:
+        x: [6.0, 14.0, 14.0, 6.0, 6.0]
+        y: [6.0, 6.0, 14.0, 14.0, 6.0]
+        height: 3.0
+
+      landing:
+        x: [6.0, 6.0]
+        y: [3.0, 3.0]
+        z: [3.0, 0.0]
+
+
+    - trajectory_id: inspection_ua_ins_3
+      priority: 6
+      ua_id: 3
+      uas_namespace: ua_ins_3
+      flight_zone_id: inspection_1
+      action_name: /inspection_1/ua_ins_1/follow_waypoints
+
+      goal_tolerance: 0.12
+      slowdown_radius: 0.20
+
+      # Partial repetition: only the mission segment is repeated.
+      # repetitions: 1 => mission flown once.
+      repetitions: 1
+
+      # Total repetition period in seconds.
+      # 0.0 disables complete takeoff-mission-landing repetition.
+      operation_frequency: 120.0
+
+      # Used to estimate operation_end_utc from total geometric distance.
+      average_speed_mps: 2.0
+
+      # Only temporal datum supplied by the operator.
+      operation_start_utc: "2026-09-02T22:00:00Z"
+
+      takeoff:
+        x: [9.0, 9.0]
+        y: [3.0, 3.0]
+        z: [0.0, 5.0]
+
+      mission:
+        x: [9.0, 4.0, 4.0, 9.0, 9.0]
+        y: [9.0, 9.0, 4.0, 4.0, 9.0]
+        height: 5.0
+
+      landing:
+        x: [9.0, 9.0]
+        y: [3.0, 3.0]
+        z: [5.0, 0.0]
+
+    - trajectory_id: inspection_ua_ins_4
+      priority: 4
+      ua_id: 4
+      uas_namespace: ua_ins_4
+      flight_zone_id: inspection_1
+      action_name: /inspection_1/ua_ins_4/follow_waypoints
+
+      goal_tolerance: 0.12
+      slowdown_radius: 0.20
+
+      # Partial repetition: only the mission segment is repeated.
+      # repetitions: 1 => mission flown once.
+      repetitions: 1
+
+      # Total repetition period in seconds.
+      # 0.0 disables complete takeoff-mission-landing repetition.
+      operation_frequency: 120.0
+
+      # Used to estimate operation_end_utc from total geometric distance.
+      average_speed_mps: 2.0
+
+      # Only temporal datum supplied by the operator.
+      operation_start_utc: "2026-09-02T22:00:00Z"
+
+      takeoff:
+        x: [12.0, 12.0]
+        y: [3.0, 3.0]
+        z: [0.0, 5.0]
+
+      mission:
+        x: [12.0, 4.0, 4.0, 12.0, 12.0]
+        y: [12.0, 12.0, 4.0, 4.0, 12.0]
+        height: 5.0
+
+      landing:
+        x: [12.0, 12.0]
+        y: [3.0, 3.0]
+        z: [5.0, 0.0]
+
+    - trajectory_id: inspection_ua_ins_5
+      priority: 5
+      ua_id: 5
+      uas_namespace: ua_ins_5
+      flight_zone_id: inspection_1
+      action_name: /inspection_1/ua_ins_5/follow_waypoints
+
+      goal_tolerance: 0.12
+      slowdown_radius: 0.20
+
+      # Partial repetition: only the mission segment is repeated.
+      # repetitions: 1 => mission flown once.
+      repetitions: 1
+
+      # Total repetition period in seconds.
+      # 0.0 disables complete takeoff-mission-landing repetition.
+      operation_frequency: 120.0
+
+      # Used to estimate operation_end_utc from total geometric distance.
+      average_speed_mps: 2.0
+
+      # Only temporal datum supplied by the operator.
+      operation_start_utc: "2026-09-02T22:00:00Z"
+
+      takeoff:
+        x: [14.0, 14.0]
+        y: [3.0, 3.0]
+        z: [0.0, 5.0]
+
+      mission:
+        x: [14.0, 12.0, 12.0, 14.0, 14.0]
+        y: [4.0, 4.0, 5.0, 5.0, 4.0]
+        height: 5.0
+
+      landing:
+        x: [14.0, 14.0]
+        y: [3.0, 3.0]
+        z: [5.0, 0.0]

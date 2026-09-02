@@ -1,0 +1,25 @@
+static_trajectory_conflict_manager_node:
+  ros__parameters:
+    requested_static_trajectories_topic: /requested_static_trajectories
+
+    # Authoritative trajectory snapshots.
+    available_static_trajectories_topic: /available_static_trajectories
+    collision_static_trajectories_topic: /collision_static_trajectories
+
+    available_static_trajectories_markers_topic: /available_static_trajectories_markers
+    collision_static_trajectories_markers_topic: /collision_static_trajectories_markers
+
+    # A geometric collision exists as soon as one pair of finite trajectory
+    # segments is separated by <= this distance while operation time windows
+    # can overlap.
+    minimum_separation_m: 1.0
+
+    # true = XYZ distance; false = XY distance.
+    use_3d: true
+
+    # Both available and collision snapshots are republished at this cadence.
+    # Outputs are also RELIABLE + TRANSIENT_LOCAL + KeepLast(1).
+    publish_period_ms: 1000
+
+    marker_line_width: 0.12
+    marker_text_height: 0.32

@@ -1,0 +1,2 @@
+std_msgs/Header header
+static_trajectory_manager/StaticTrajectory[] trajectories

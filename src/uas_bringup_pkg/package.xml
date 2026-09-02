@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>uas_bringup_pkg</name>
+  <version>0.1.0</version>
+  <description>Per-UAS and multi-UAS bringup for PX4 SITL, ROS 2 and Gazebo.</description>
+  <maintainer email="ricardo@example.com">Ricardo</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>std_msgs</depend>
+  <depend>srv_msgs</depend>  
+  <depend>tf2_ros</depend>
+  <depend>tf2_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>micro_ros_agent</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>deconfliction_manager</name>
+  <version>0.4.0</version>
+
+  <description>
+    Classifies detected static-trajectory collisions into requested supervision
+    or manual adjustment while preserving complete DetectedCollisionTrajectory
+    collision evidence and publishing RViz markers for both states.
+  </description>
+
+  <maintainer email="maintainer@example.com">A-space</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>static_trajectory_manager</depend>
+  <depend>collision_detection</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

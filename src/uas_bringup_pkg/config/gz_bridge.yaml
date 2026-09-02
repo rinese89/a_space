@@ -1,0 +1,9 @@
+# Bridge común de Gazebo a ROS 2.
+# En esta primera versión se publica /clock para use_sim_time.
+# Los sensores de los modelos pueden añadirse posteriormente aquí.
+
+- ros_topic_name: /clock
+  gz_topic_name: /clock
+  ros_type_name: rosgraph_msgs/msg/Clock
+  gz_type_name: gz.msgs.Clock
+  direction: GZ_TO_ROS

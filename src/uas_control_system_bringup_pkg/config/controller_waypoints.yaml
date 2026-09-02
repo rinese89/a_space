@@ -1,0 +1,96 @@
+uas_bringup:
+  use_sim_time: true
+  group:
+    num_uas: 1
+    start_id: 1
+    namespace_prefix: ua_
+  flight_zone_assignment:
+    required: true
+    default_zone_id: test
+  px4:
+    directory: /home/rinese/PX4-Autopilot
+    binary: build/px4_sitl_default/bin/px4
+    sys_autostart: 4001
+    sim_model: gz_x500
+    standalone_gazebo: true
+    instance_offset: -1
+    start_delay_s: 1.0
+    stagger_s: 0.35
+  spawn:
+    origin:
+    - 0.0
+    - 0.0
+    - 0.0
+    spacing:
+    - 3.0
+    - 3.0
+    - 0.0
+    row_length: 5
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  micro_ros_agent:
+    start: true
+    transport: udp4
+    port: 8888
+  gazebo_bridge:
+    start: true
+    node_name: gz_parameter_bridge
+    config_file: ''
+  drone_odom_broadcaster:
+    enabled: true
+    start_delay_s: 3.0
+    stagger_s: 0.1
+    vehicle_odometry_topic: fmu/out/vehicle_odometry
+    odom_topic: odom
+    reset_service: reset_odom_srv
+    odom_frame: odom
+    base_frame: base_link
+  robot_state_publisher:
+    enabled: true
+    urdf_file: ''
+    publish_frequency: 30.0
+  control_waypoints:
+    enabled: true
+    package: controllers_pkg
+    executable: control_waypoints_node
+    node_name: control_waypoints_node
+    start_delay_s: 0.0
+    stagger_s: 0.1
+    target_system_offset: 0
+    vehicle_command_topic: fmu/in/vehicle_command
+    offboard_control_mode_topic: fmu/in/offboard_control_mode
+    trajectory_setpoint_topic: fmu/in/trajectory_setpoint
+    vehicle_status_topic: fmu/out/vehicle_status
+    odom_topic: odom
+    marker_topic: mission_markers
+    arm_takeoff_service: arm_takeoff
+    follow_waypoints_action: follow_waypoints
+    marker_frame_suffix: odom
+    marker_frame: ''
+    pid:
+      x:
+        kp: 0.9
+        ki: 0.0
+        kd: 0.15
+        integral_limit: 2.0
+      y:
+        kp: 0.9
+        ki: 0.0
+        kd: 0.15
+        integral_limit: 2.0
+      z:
+        kp: 0.8
+        ki: 0.0
+        kd: 0.1
+        integral_limit: 2.0
+    limits:
+      max_vx: 1.5
+      max_vy: 1.5
+      max_vz: 0.8
+      max_speed_xy: 1.8
+    timing:
+      control_period_ms: 50.0
+    takeoff:
+      tolerance_xy: 0.3
+      tolerance_z: 0.2

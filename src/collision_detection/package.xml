@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>collision_detection</name>
+  <version>0.1.0</version>
+
+  <description>
+    Second-stage A-space collision detector. Uses the retained collision
+    trajectory snapshot and the virtual-net discretization to identify exact
+    shared lattice nodes and edges with other loaded trajectories.
+  </description>
+
+  <maintainer email="maintainer@example.com">A-space</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>a_space_virtual_net</depend>
+  <depend>static_trajectory_manager</depend>
+  <depend>static_trajectory_conflict_manager</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

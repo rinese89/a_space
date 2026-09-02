@@ -1,0 +1,16 @@
+collision_detection_node:
+  ros__parameters:
+    collision_static_trajectories_topic: /collision_static_trajectories
+    net_loaded_trajectories_topic: /net_loaded_trajectories
+
+    detected_collision_trajectories_topic: /detected_collision_trajectories
+    detected_collision_markers_topic: /detected_collision_trajectories_markers
+
+    # Authoritative detected state is republished every second.
+    publish_period_ms: 1000
+
+    # RViz collision visualization.
+    collision_segment_width: 0.18
+    collision_node_scale: 0.32
+    label_height: 0.36
+    publish_labels: true

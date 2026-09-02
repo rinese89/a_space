@@ -1,0 +1,4 @@
+# Optional parameters to add to the control_waypoints node configuration.
+# The C++ defaults are identical, so the node also works without adding them.
+landing_tolerance_xy: 0.30
+landing_command_retry_s: 1.0

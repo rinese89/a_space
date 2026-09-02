@@ -1,0 +1,108 @@
+# Configuración geométrica GLOBAL de flight zones.
+#
+# Todas las coordenadas están expresadas en el frame ROS map:
+#   x: Este, y: Norte, z: Arriba.
+#
+# Un único flight_zone_server_node publica todas las zonas en /flight_zones.
+# La asociación UAS -> flight zone no se almacena aquí: en esta fase se
+# obtiene del namespace <flight_zone_id>/<uas> descubierto mediante TF.
+
+frame_id: map
+
+zones:
+  - zone_id: inspection_1
+    display_name: "Inspection flight zone 1"
+    zone_type: inclusion
+    enabled: true
+    safety_margin: 1.0
+
+    visualization:
+      surface_rgba: [1.00, 0.20, 0.80, 0.25]
+      edge_rgba:    [1.00, 0.20, 0.80, 1.00]
+      text_rgba:    [1.00, 0.50, 0.80, 1.00]
+      line_width: 0.08
+      text_height: 0.65
+      show_surface: true
+
+    # Geometría efectiva: x=0..15, y=0..10, z=0..6 m.
+    vertices:
+      - [0.0, 0.0, 0.0]
+      - [15.0, 0.0, 0.0]
+      - [15.0, 15.0, 0.0]
+      - [0.0, 15.0, 0.0]
+      - [0.0, 0.0, 6.0]
+      - [15.0, 0.0, 6.0]
+      - [15.0, 15.0, 6.0]
+      - [0.0, 15.0, 6.0]
+    faces:
+      - [0, 3, 2, 1]
+      - [4, 5, 6, 7]
+      - [0, 1, 5, 4]
+      - [1, 2, 6, 5]
+      - [2, 3, 7, 6]
+      - [3, 0, 4, 7]
+
+  - zone_id: logistic_1
+    display_name: "Logistics flight zone 1"
+    zone_type: inclusion
+    enabled: true
+    safety_margin: 1.0
+
+    visualization:
+      surface_rgba: [0.10, 0.60, 1.00, 0.25]
+      edge_rgba:    [0.10, 0.60, 1.00, 1.00]
+      text_rgba:    [0.40, 0.60, 1.00, 1.00]
+      line_width: 0.08
+      text_height: 0.65
+      show_surface: true
+
+    # Geometría efectiva según los vértices de la última configuración:
+    # x=0..15, y=0..10, z=8..12 m.
+    vertices:
+      - [0.0, 0.0, 8.0]
+      - [15.0, 0.0, 8.0]
+      - [15.0, 15.0, 8.0]
+      - [0.0, 15.0, 8.0]
+      - [0.0, 0.0, 12.0]
+      - [15.0, 0.0, 12.0]
+      - [15.0, 15.0, 12.0]
+      - [0.0, 15.0, 12.0]
+    faces:
+      - [0, 3, 2, 1]
+      - [4, 5, 6, 7]
+      - [0, 1, 5, 4]
+      - [1, 2, 6, 5]
+      - [2, 3, 7, 6]
+      - [3, 0, 4, 7]
+
+  - zone_id: survillance_1
+    display_name: "Survillance flight zone 1"
+    zone_type: inclusion
+    enabled: true
+    safety_margin: 1.0
+
+    visualization:
+      surface_rgba: [0.90, 0.90, 0.10, 0.25]
+      edge_rgba:    [0.90, 0.90, 0.10, 1.00]
+      text_rgba:    [0.90, 0.90, 0.40, 1.00]
+      line_width: 0.08
+      text_height: 0.65
+      show_surface: true
+
+    # Geometría efectiva: x=0..15, y=0..10, z=14..18 m.
+    vertices:
+      - [0.0, 0.0, 14.0]
+      - [15.0, 0.0, 14.0]
+      - [15.0, 15.0, 14.0]
+      - [0.0, 15.0, 14.0]
+      - [0.0, 0.0, 18.0]
+      - [15.0, 0.0, 18.0]
+      - [15.0, 15.0, 18.0]
+      - [0.0, 15.0, 18.0]
+    faces:
+      - [0, 3, 2, 1]
+      - [4, 5, 6, 7]
+      - [0, 1, 5, 4]
+      - [1, 2, 6, 5]
+      - [2, 3, 7, 6]
+      - [3, 0, 4, 7]

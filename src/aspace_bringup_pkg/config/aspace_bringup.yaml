@@ -1,0 +1,35 @@
+# Configuración de los procesos comunes del sistema A-space.
+# Este fichero no es un fichero de parámetros de un nodo ROS 2: lo lee el launch.
+
+aspace:
+  use_sim_time: true
+
+  qgroundcontrol:
+    enabled: false
+    executable: /home/rinese/QGroundControl-x86_64.AppImage
+    startup_delay_s: 2.0
+
+  gazebo:
+    enabled: true
+    px4_dir: /home/rinese/PX4-Autopilot
+
+    # Se puede indicar una ruta absoluta. Si se deja vacío, el launch busca:
+    #   <px4_dir>/Tools/simulation/gz/worlds/<world_name>.sdf
+    world_file: ""
+    world_name: default
+
+    # false: servidor + GUI. true: solamente servidor.
+    headless: true
+    run_immediately: true
+    verbosity: 3
+    startup_delay_s: 0.0
+
+    # El entorno de PX4 añade los modelos y mundos de Gazebo al resource path.
+    # Debe existir después de compilar PX4 SITL al menos una vez.
+    gz_environment_script: build/px4_sitl_default/rootfs/gz_env.sh
+
+  rviz:
+    enabled: true
+    # Vacío = usar rviz/aspace.rviz del paquete.
+    config_file: "/home/rinese/a_space_ws/src/aspace_bringup_pkg/rviz/config_1.rviz"
+    startup_delay_s: 3.0

@@ -1,0 +1,178 @@
+# Configuración maestra del lanzamiento de uno o varios UAS.
+#
+# La geometría de las flight zones se crea previamente mediante
+# flight_zone_manager. Este fichero únicamente define la asignación lógica
+# UAS -> flight_zone_id.
+#
+# El launch permite sobrescribir:
+#   num_uas, start_id, start_agent, start_bridge y flight_zone_id.
+
+uas_bringup:
+
+  use_sim_time: true
+
+  group:
+    num_uas: 1
+    start_id: 1
+    namespace_prefix: ua_
+
+  # -------------------------------------------------------------------------
+  # Asignación UAS -> flight zone
+  #
+  # Prioridad aplicada por el launch:
+  #   1. Argumento flight_zone_id:=...
+  #   2. Entrada assignments por namespace, por ejemplo ua_1
+  #   3. Entrada assignments por id, por ejemplo "1"
+  #   4. default_zone_id
+  #
+  # La existencia geométrica de la zona se validará posteriormente mediante
+  # el gestor/monitor de asignaciones. En esta fase se valida que el
+  # identificador no esté vacío cuando required=true.
+  # -------------------------------------------------------------------------
+  flight_zone_assignment:
+    required: true
+    default_zone_id: test
+
+    assignments:
+      ua_1: test
+
+      # También se admite el id como clave:
+      # "3": inspection_1
+
+  px4:
+    directory: /home/rinese/PX4-Autopilot
+    binary: build/px4_sitl_default/bin/px4
+    sys_autostart: 4001
+    sim_model: gz_x500
+    standalone_gazebo: true
+
+    # El id del UAS coincide con MAV_SYS_ID:
+    #   ua_1, id=1 -> PX4 instance 0
+    #   ua_2, id=2 -> PX4 instance 1
+    instance_offset: -1
+
+    start_delay_s: 1.0
+    stagger_s: 0.35
+
+  spawn:
+    # Posición del primer UAS en map/Gazebo.
+    origin: [0.0, 0.0, 0.0]
+
+    # Separación entre columnas, filas y altura incremental.
+    spacing: [3.0, 3.0, 0.0]
+    row_length: 5
+
+    # Orientación inicial del vehículo en Gazebo.
+    # No se aplica a map -> odom; la actitud aparece en la odometría.
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+
+  micro_ros_agent:
+    start: true
+    transport: udp4
+    port: 8888
+
+  gazebo_bridge:
+    start: true
+    node_name: gz_parameter_bridge
+
+    # Vacío = usar config/gz_bridge.yaml del paquete.
+    config_file: ""
+
+  drone_odom_broadcaster:
+    enabled: true
+
+    start_delay_s: 3.0
+    stagger_s: 0.10
+
+    # Nombres relativos dentro del namespace ua_N.
+    vehicle_odometry_topic: fmu/out/vehicle_odometry
+    odom_topic: odom
+    reset_service: reset_odom_srv
+
+    # El nodo genera ua_N/odom y ua_N/base_link.
+    odom_frame: odom
+    base_frame: base_link
+
+  robot_state_publisher:
+    enabled: true
+
+    # Vacío = usar urdf/x500_base.urdf del paquete.
+    urdf_file: ""
+    publish_frequency: 30.0
+
+  # -------------------------------------------------------------------------
+  # Controlador de waypoints
+  #
+  # control_waypoints.launch.py utiliza esta sección para crear un controlador
+  # por cada UAS definido en group. Los nombres de tópicos, servicio y acción
+  # son relativos al namespace:
+  #
+  #   <flight_zone_id>/<namespace_prefix><id>
+  #
+  # Para esta configuración:
+  #   test/ua_1
+  # -------------------------------------------------------------------------
+  control_waypoints:
+    enabled: true
+
+    package: controllers_pkg
+    executable: control_waypoints_node
+    node_name: control_waypoints_node
+
+    start_delay_s: 0.0
+    stagger_s: 0.10
+
+    # target_system = ua_id + target_system_offset
+    target_system_offset: 0
+
+    # Nombres relativos: ROS 2 añade automáticamente /test/ua_1.
+    vehicle_command_topic: fmu/in/vehicle_command
+    offboard_control_mode_topic: fmu/in/offboard_control_mode
+    trajectory_setpoint_topic: fmu/in/trajectory_setpoint
+    vehicle_status_topic: fmu/out/vehicle_status
+    odom_topic: odom
+    marker_topic: mission_markers
+    arm_takeoff_service: arm_takeoff
+    follow_waypoints_action: follow_waypoints
+
+    landing_tolerance_xy: 0.30
+    landing_command_retry_s: 1.0
+
+    # El nodo genera test/ua_1/odom como frame de los marcadores.
+    marker_frame_suffix: odom
+    marker_frame: ""
+
+    pid:
+      x:
+        kp: 0.90
+        ki: 0.00
+        kd: 0.15
+        integral_limit: 2.0
+
+      y:
+        kp: 0.90
+        ki: 0.00
+        kd: 0.15
+        integral_limit: 2.0
+
+      z:
+        kp: 0.80
+        ki: 0.00
+        kd: 0.10
+        integral_limit: 2.0
+
+    limits:
+      max_vx: 1.50
+      max_vy: 1.50
+      max_vz: 0.80
+      max_speed_xy: 1.80
+
+    timing:
+      control_period_ms: 50.0
+
+    takeoff:
+      tolerance_xy: 0.30
+      tolerance_z: 0.20
+  

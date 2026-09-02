@@ -1,0 +1,13 @@
+supervision_trajectory_manager_node:
+  ros__parameters:
+    requested_supervision_trajectories_topic: /requested_supervision_trajectories
+    available_trajectories_topic: /available_static_trajectories
+    adjusted_trajectories_topic: /adjusted_trajectories
+    supervised_trajectories_topic: /supervised_trajectories
+    supervision_markers_topic: /supervision_trajectory_manager_markers
+    publish_period_ms: 1000
+    node_position_tolerance_m: 0.75
+    geometry_match_tolerance_m: 0.000001
+    pending_line_width: 0.12
+    supervised_node_scale: 0.32
+    supervised_text_height: 0.28

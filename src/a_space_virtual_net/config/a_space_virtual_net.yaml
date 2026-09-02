@@ -1,0 +1,27 @@
+a_space_virtual_net_node:
+  ros__parameters:
+    frame_id: map
+
+    origin_x: 0.0
+    origin_y: 0.0
+    origin_z: 0.0
+
+    size_x: 20.0
+    size_y: 20.0
+    size_z: 10.0
+
+    density_net: 1.0
+    edge_capacity: 1
+
+    available_static_trajectories_topic: /available_static_trajectories
+    collision_static_trajectories_topic: /collision_static_trajectories
+
+    net_loaded_trajectories_topic: /net_loaded_trajectories
+    virtual_net_state_topic: /a_space_virtual_net/state
+    virtual_net_markers_topic: /a_space_virtual_net/markers
+
+    publish_period_ms: 1000
+
+    free_line_width: 0.025
+    trajectory_line_width: 0.10
+    marker_alpha: 0.95

@@ -1,0 +1,7 @@
+std_msgs/Header header
+uint32 removed_expected_count
+uint32 solved_expected_count
+uint32 verified_count
+uint32 pending_count
+uint32 contradictory_count
+updated_flow_server/FlowTrajectoryStatus[] trajectories

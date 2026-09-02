@@ -1,0 +1,9 @@
+# Store the ORIGINAL trajectory before trajectory_server_node delays its
+# operation_start_utc because it must wait for an already-active lower-priority
+# trajectory.
+#
+# No extra_time is computed by this service.
+static_trajectory_manager/StaticTrajectory trajectory
+---
+bool accepted
+string message

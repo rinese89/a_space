@@ -1,0 +1,19 @@
+# Goal
+float64[] x
+float64[] y
+float64 height
+float64 goal_tolerance
+float64 slowdown_radius
+uint32 repetitions
+---
+# Result
+bool success
+string message
+uint32 waypoints_reached
+---
+# Feedback
+geometry_msgs/Pose pose
+uint8 nav_state
+uint8 arming_state
+uint32 current_waypoint
+float64 distance_to_waypoint

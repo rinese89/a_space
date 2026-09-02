@@ -1,0 +1,113 @@
+# Configuración conjunta de los cuatro controladores de la operación del puerto.
+#
+# Los nodos ROS mantienen el namespace jerárquico:
+#
+#   /<flight_zone_id>/<uas_namespace>
+#
+# Los tópicos nativos de PX4 utilizan un namespace DDS plano:
+#
+#   /<flight_zone_id>_<uas_namespace>/fmu/...
+#
+# La escritura "survillance" se conserva para coincidir con los identificadores
+# y ficheros utilizados actualmente por la operación.
+
+control_waypoints:
+
+  use_sim_time: true
+
+  defaults:
+    package: controllers_pkg
+    executable: control_waypoints_node
+    node_name: control_waypoints_node
+
+    start_delay_s: 0.0
+    stagger_s: 0.10
+
+    # Sufijos de los tópicos nativos de PX4. El launch antepone para cada UAS
+    # su px4_dds_namespace y genera nombres absolutos.
+    px4_topics:
+      vehicle_command: fmu/in/vehicle_command
+      offboard_control_mode: fmu/in/offboard_control_mode
+      trajectory_setpoint: fmu/in/trajectory_setpoint
+      vehicle_status: fmu/out/vehicle_status
+
+    # Interfaces propias del controlador. Deben permanecer relativas para que
+    # ROS 2 las coloque bajo ros_namespace.
+    ros_interfaces:
+      odom_topic: odom
+      marker_topic: mission_markers
+      arm_takeoff_service: arm_takeoff
+      follow_waypoints_action: follow_waypoints
+
+    marker_frame_suffix: odom
+    marker_frame: ""
+
+    # Los goals FollowWaypoints están expresados en map.
+    # Cada controlador los transforma a su odom local mediante TF.
+    mission_frame: map
+    odom_frame_suffix: odom
+    transform_timeout_s: 0.20
+
+    pid:
+      x:
+        kp: 0.90
+        ki: 0.00
+        kd: 0.15
+        integral_limit: 2.0
+
+      y:
+        kp: 0.90
+        ki: 0.00
+        kd: 0.15
+        integral_limit: 2.0
+
+      z:
+        kp: 0.80
+        ki: 0.00
+        kd: 0.10
+        integral_limit: 2.0
+
+    limits:
+      max_vx: 1.50
+      max_vy: 1.50
+      max_vz: 0.80
+      max_speed_xy: 1.80
+
+    timing:
+      control_period_ms: 50.0
+
+    takeoff:
+      tolerance_xy: 0.30
+      tolerance_z: 0.20
+
+  controllers:
+
+    # port_inspection_uas_bringup.yaml:
+    # num_uas=2, start_id=1, namespace_prefix=ua_ins
+    - controller_id: inspection_ua_1
+      enabled: true
+      ros_namespace: inspection_1/ua_ins_1
+      px4_dds_namespace: inspection_1_ua_ins_1
+      target_system: 1
+
+    - controller_id: inspection_ua_2
+      enabled: true
+      ros_namespace: inspection_1/ua_ins_2
+      px4_dds_namespace: inspection_1_ua_ins_2
+      target_system: 2
+
+    # port_logistics_uas_bringup.yaml:
+    # num_uas=1, start_id=3, namespace_prefix=ua_log
+    - controller_id: logistics_ua_3
+      enabled: true
+      ros_namespace: logistic_1/ua_log_3
+      px4_dds_namespace: logistic_1_ua_log_3
+      target_system: 3
+
+    # port_survillance_uas_bringup.yaml:
+    # num_uas=1, start_id=4, namespace_prefix=ua_sur
+    - controller_id: survillance_ua_4
+      enabled: true
+      ros_namespace: survillance_1/ua_sur_4
+      px4_dds_namespace: survillance_1_ua_sur_4
+      target_system: 4

@@ -1,0 +1,37 @@
+trajectory_server_node:
+  ros__parameters:
+    available_static_trajectories_topic: /available_static_trajectories
+    active_trajectories_topic: /active_trajectories
+    collision_static_trajectories_topic: /collision_static_trajectories
+    active_trajectories_markers_topic: /active_trajectories_markers
+
+    # Candidate lifecycle:
+    #   T-60 s -> copy the occurrence into the server's pending store.
+    #   T-30 s -> try to publish it in /active_trajectories.
+    storage_lead_time_s: 60.0
+    publication_lead_time_s: 30.0
+
+    # When a higher-priority candidate has to wait for a lower-priority active
+    # spatial conflict, new start = real blocker completion + this margin.
+    reschedule_margin_s: 5.0
+
+    # Preserve the declared theoretical duration when operation_start_utc is
+    # delayed. This shifts operation_end_utc by the same amount; it does NOT
+    # calculate extra_time.
+    preserve_duration_on_reschedule: true
+
+    # PX4 DDS namespace is flattened:
+    # /<flight_zone_id>_<uas_namespace>/fmu/out/vehicle_status
+    vehicle_status_suffix: fmu/out/vehicle_status
+    vehicle_status_timeout_s: 2.0
+
+    # Runtime conflict check is purely static geometry against trajectories
+    # already present in /active_trajectories. No UAS motion reconstruction.
+    spatial_conflict_distance_m: 1.0
+    use_3d: true
+    max_segment_collisions_per_pair: 64
+
+    supervision_period_ms: 200
+
+    marker_line_width: 0.14
+    marker_text_height: 0.34

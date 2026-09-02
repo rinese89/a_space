@@ -1,0 +1,35 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    # Geometría global publicada por flight_zone_server_node.
+    zone_topic: /flight_zones
+
+    # Descubrimiento GLOBAL de UAS mediante el patrón:
+    #   <flight_zone_id>/<uas>/odom -> <flight_zone_id>/<uas>/base_link
+    tf_topic: /tf
+    uas_prefix: ua_
+    odom_frame_suffix: odom
+    base_frame_suffix: base_link
+
+    # Tras descubrir un UAS, se crea dinámicamente:
+    #   /<flight_zone_id>/<uas>/odom
+    odom_topic_suffix: odom
+
+    # zone_status está fijado en código para evitar variantes incompatibles.
+    # Salidas dinámicas adicionales:
+    #   /<flight_zone_id>/<uas>/inside_flight_zone
+    #   /<flight_zone_id>/<uas>/zone_status/markers
+    inside_topic_suffix: inside_flight_zone
+    marker_topic_suffix: zone_status/markers
+
+    target_frame: map
+    tf_timeout_s: 0.10
+
+    boundary_tolerance_m: 0.03
+    boundary_is_inside: true
+
+    publish_markers: true
+    marker_sphere_diameter_m: 0.45
+    marker_text_height_m: 0.45
+    marker_text_offset_z_m: 0.75

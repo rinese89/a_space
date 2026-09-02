@@ -1,0 +1,26 @@
+static_trajectory_conflict_manager_node:
+  ros__parameters:
+    requested_static_trajectories_topic: /requested_static_trajectories
+    available_trajectories_topic: /available_trajectories
+    conflicted_trajectories_topic: /conflicted_trajectories
+    available_trajectories_markers_topic: /available_trajectories_markers
+    conflicted_trajectories_markers_topic: /conflicted_trajectories_markers
+
+    # RViz marker dimensions. Conflicted trajectory lines are rendered at
+    # 1.5 times marker_line_width to make them visually easier to identify.
+    marker_line_width: 0.12
+    marker_text_height: 0.32
+
+    # Spatial separation at or below which two simultaneous UAS positions
+    # are considered in conflict.
+    minimum_separation_m: 1.0
+
+    # Compare positions in XYZ. If false, Z is ignored and conflicts are 2D.
+    use_3d: true
+
+    # Total repetitions are periodic and can be indefinite. Only occurrences
+    # intersecting [now, now + analysis_horizon_s] are materialised.
+    analysis_horizon_s: 86400.0
+
+    # Safety bound for pathological configurations with very small periods.
+    max_occurrences_per_trajectory: 10000

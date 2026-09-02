@@ -1,0 +1,30 @@
+trajectory_server_node:
+  ros__parameters:
+    available_static_trajectories_topic: /available_static_trajectories
+    active_trajectories_topic: /active_trajectories
+    collision_static_trajectories_topic: /collision_static_trajectories
+    active_trajectories_markers_topic: /active_trajectories_markers
+
+    # Before a strictly higher-priority candidate is rescheduled, its ORIGINAL
+    # trajectory is stored by trajectory_endtime_adjustment_node.
+    original_trajectory_registration_service: /trajectory_endtime_adjustment/register_original_trajectory
+
+    storage_lead_time_s: 60.0
+    publication_lead_time_s: 30.0
+    reschedule_margin_s: 5.0
+
+    # This controls only the copy published in /active_trajectories.
+    # It does NOT define extra_time. The adjustment node measures the real
+    # duration after this active occurrence disappears.
+    preserve_duration_on_reschedule: true
+
+    vehicle_status_suffix: fmu/out/vehicle_status
+    vehicle_status_timeout_s: 2.0
+
+    spatial_conflict_distance_m: 1.0
+    use_3d: true
+    max_segment_collisions_per_pair: 64
+
+    supervision_period_ms: 200
+    marker_line_width: 0.14
+    marker_text_height: 0.34

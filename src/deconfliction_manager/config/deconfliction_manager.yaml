@@ -1,0 +1,24 @@
+deconfliction_manager_node:
+  ros__parameters:
+    detected_collision_trajectories_topic: /detected_collision_trajectories
+
+    requested_supervision_trajectories_topic: /requested_supervision_trajectories
+    manual_adjustment_trajectories_topic: /manual_adjustment_trajectories
+
+    deconfliction_markers_topic: /deconfliction_manager_markers
+
+    # resources = collision_nodes + collision_segments
+    # resources < threshold  -> requested supervision
+    # resources >= threshold -> manual adjustment
+    collision_resource_threshold: 5
+
+    # Outputs and markers are republished every second.
+    publish_period_ms: 1000
+
+    # RViz: requested supervision = only conflicting nodes + labels.
+    supervision_node_scale: 0.30
+    supervision_text_height: 0.28
+
+    # RViz: manual adjustment = complete trajectory + label.
+    manual_line_width: 0.14
+    manual_text_height: 0.36

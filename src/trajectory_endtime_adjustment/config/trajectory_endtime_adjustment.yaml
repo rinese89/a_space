@@ -1,0 +1,6 @@
+trajectory_endtime_adjustment_node:
+  ros__parameters:
+    active_trajectories_topic: /active_trajectories
+    adjusted_trajectories_topic: /adjusted_trajectories
+
+    original_trajectory_registration_service: /trajectory_endtime_adjustment/register_original_trajectory

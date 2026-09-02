@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>flight_zone_global_manager</name>
+  <version>0.1.0</version>
+  <description>
+    Global ROS 2 Humble flight-zone server and UAS flight-zone monitor for A-space.
+  </description>
+
+  <maintainer email="maintainer@example.com">A-space</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>ament_index_cpp</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>rclcpp</depend>
+  <depend>flight_zone_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
+  <depend>yaml-cpp</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
