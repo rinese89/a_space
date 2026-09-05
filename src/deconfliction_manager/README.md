@@ -1,217 +1,271 @@
-# deconfliction_manager
+# deconfliction_manager 0.5.0
 
-ROS 2 Humble package containing:
+ROS 2 Humble package implementing collision-count classification and the first
+geometry crop for supervised trajectories.
 
-```text
-deconfliction_manager_node
-```
-
-## Purpose
-
-The node classifies the authoritative snapshot received on:
+## Inputs
 
 ```text
 /detected_collision_trajectories
+  collision_detection/msg/DetectedCollisionTrajectoryArray
+
+/net_loaded_trajectories
+  a_space_virtual_net/msg/NetLoadedTrajectoryArray
 ```
 
-Type:
+Both subscriptions use:
 
 ```text
-collision_detection/msg/DetectedCollisionTrajectoryArray
+RELIABLE + TRANSIENT_LOCAL + KeepLast(1)
 ```
 
-into exactly two outputs:
+`/detected_collision_trajectories` is the authoritative collision snapshot.
+
+`/net_loaded_trajectories` provides the complete route already discretized into
+adjacent virtual-net edges. It is used only to build the crop; the node does not
+repeat the virtual-net projection algorithm.
+
+## Classification change
+
+The old implementation used:
 
 ```text
-/requested_supervision_trajectories
-/manual_adjustment_trajectories
+collision_nodes.size + collision_segments.size
 ```
 
-Both outputs now use exactly the same type as the input:
+as its threshold resource count.
+
+This version uses only:
 
 ```text
-collision_detection/msg/DetectedCollisionTrajectoryArray
+number of UNIQUE collision node_id values
 ```
 
-This preserves all collision evidence for downstream managers.
-
-## Classification
-
-For every `DetectedCollisionTrajectory`:
+Therefore:
 
 ```text
-collision_resource_count =
-    collision_nodes.size()
-  + collision_segments.size()
+unique_collision_nodes < collision_node_threshold
+    -> REQUESTED_SUPERVISION
+
+unique_collision_nodes >= collision_node_threshold
+    -> MANUAL_ADJUSTMENT
 ```
 
-With the default:
+Default:
 
 ```yaml
-collision_resource_threshold: 5
+collision_node_threshold: 5
 ```
 
-classification is:
+### Partial repetitions
 
-```text
-resources < 5  -> /requested_supervision_trajectories
-resources >= 5 -> /manual_adjustment_trajectories
-```
+A partial mission repetition may traverse the same virtual-net geometry several
+times. It must not multiply the collision count.
 
-The threshold comparison is strict.
+The manager stores all `collision_nodes[].node_id` values in a set before
+classification. The same lattice node is therefore counted once regardless of
+how many repeated mission traversals touch it.
 
-## Preserved data
+The `collision_segments[]` count is not part of the threshold.
 
-The node does not reduce either output to `StaticTrajectory`.
+## New `/requested_supervision_trajectories` type
 
-Every output entry keeps the complete original:
-
-```text
-DetectedCollisionTrajectory
-```
-
-including:
-
-```text
-trajectory
-loaded_on_net
-has_shared_net_space
-conflicting_trajectory_ids[]
-collision_nodes[]
-collision_segments[]
-```
-
-This is required by `supervision_trajectory_manager_node`, which consumes:
+The topic is now:
 
 ```text
 /requested_supervision_trajectories
+deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
 ```
 
-and needs `collision_nodes[]` and `collision_segments[]` to generate the cropped
-trajectory published on `/adjusted_trajectories`.
-
-## Snapshot semantics
-
-The input is authoritative.
-
-Every new `/detected_collision_trajectories` snapshot completely rebuilds both
-classification outputs. Therefore:
+Each item contains:
 
 ```text
-trajectory disappears from input
-        -> disappears from both outputs
+RequestedSupervisionTrajectory
+├── detected_collision
+│   └── collision_detection/msg/DetectedCollisionTrajectory
+│       ├── trajectory
+│       ├── loaded_on_net
+│       ├── has_shared_net_space
+│       ├── conflicting_trajectory_ids[]
+│       ├── collision_nodes[]
+│       └── collision_segments[]
+│
+└── cropped_trajectory
+    └── deconfliction_manager/msg/CroppedNetTrajectory
+        ├── retained_nodes[]
+        ├── retained_segments[]
+        ├── removed_node_ids[]
+        ├── removed_segments[]
+        └── removed_edge_ids[]
 ```
 
-and a trajectory can change classification if its current collision-resource
-count changes.
+So the complete previous collision-detection payload is preserved, and the crop
+is added alongside it.
 
-## Ordering
+## Why the crop is represented as virtual-net segments
 
-Output arrays are deterministic:
+A `static_trajectory_manager/msg/TrajectorySegment` is one contiguous x/y/z
+polyline.
+
+If a middle section is removed, for example:
 
 ```text
-1. priority ascending
-2. ua_id ascending
-3. trajectory_id ascending
+(3,3) -> (3,4) -> [removed 3,5 ... 3,8] -> (3,9) -> (3,10)
 ```
 
-Lower numerical priority has higher precedence.
+putting the remaining points into one `TrajectorySegment` would incorrectly
+create a new artificial edge:
+
+```text
+(3,4) -> (3,9)
+```
+
+Therefore the crop is intentionally represented as independent
+`NetTrajectorySegment` edges. It can represent disconnected surviving pieces
+without reconnecting across the removed collision region.
+
+## Exact crop rule
+
+Let:
+
+```text
+C_nodes = all collision_nodes[].node_id
+C_edges = all collision_segments[].edge_id
+```
+
+A complete virtual-net edge is removed if:
+
+```text
+edge_id in C_edges
+OR
+start_node_id in C_nodes
+OR
+end_node_id in C_nodes
+```
+
+The last two conditions remove the boundary edges adjacent to a collision node.
+
+### Example
+
+Complete discretized route:
+
+```text
+(3,3)
+ -> (3,4)
+ -> (3,5)
+ -> (3,6)
+ -> (3,7)
+ -> (3,8)
+ -> (3,9)
+ -> (3,10)
+```
+
+Collision nodes:
+
+```text
+(3,5), (3,6), (3,7), (3,8)
+```
+
+Removed edges:
+
+```text
+(3,4) -> (3,5)
+(3,5) -> (3,6)
+(3,6) -> (3,7)
+(3,7) -> (3,8)
+(3,8) -> (3,9)
+```
+
+Retained geometry:
+
+```text
+(3,3) -> (3,4)
+
+(3,9) -> (3,10)
+```
+
+The non-collision boundary nodes `(3,4)` and `(3,9)` remain in
+`retained_nodes[]`.
+
+## Geometry only once
+
+The crop is a geometry representation, not a list of every repeated temporal
+traversal.
+
+`retained_segments[]` and `removed_segments[]` emit only the first occurrence
+of each:
+
+```text
+(phase, edge_id)
+```
+
+Thus partial mission repetitions do not duplicate the same lattice geometry in
+the crop.
+
+The original `source_repetitions` value is retained in the message.
+
+## Crop availability
+
+If the collision snapshot arrives before the retained
+`/net_loaded_trajectories` snapshot, the requested item is still published with:
+
+```text
+cropped_trajectory.complete = false
+```
+
+When the net snapshot arrives, the manager automatically recomputes and
+republishes the same supervision request with:
+
+```text
+complete = true
+```
+
+Consumers must not use an incomplete crop for reinsertion.
+
+## Manual output
+
+The manual branch remains unchanged:
+
+```text
+/manual_adjustment_trajectories
+collision_detection/msg/DetectedCollisionTrajectoryArray
+```
 
 ## QoS
 
-Input and outputs use:
-
-```text
-RELIABLE
-TRANSIENT_LOCAL
-KeepLast(1)
-```
-
-The two classification snapshots and the RViz markers are also republished
-every:
-
-```yaml
-publish_period_ms: 1000
-```
-
-Empty snapshots are intentionally published.
-
-## RViz markers
-
-Topic:
-
-```text
-/deconfliction_manager_markers
-```
-
-### Requested supervision
-
-Only collision nodes are visualized:
-
-```text
-yellow/orange sphere + label
-```
-
-The label contains:
-
-```text
-trajectory_id | node=<node_id> | vs=<conflicting trajectory IDs>
-```
-
-### Manual adjustment
-
-The complete original static trajectory is visualized in red together with its
-trajectory ID.
-
-Every marker snapshot starts with `DELETEALL` so stale markers are removed.
-
-## Topics
-
-### Input
-
-```text
-/detected_collision_trajectories
-collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-### Outputs
+Outputs:
 
 ```text
 /requested_supervision_trajectories
-collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-```text
 /manual_adjustment_trajectories
+/deconfliction_manager_markers
+```
+
+use:
+
+```text
+RELIABLE + TRANSIENT_LOCAL + KeepLast(1)
+```
+
+and are also republished every `publish_period_ms`.
+
+## Important downstream change
+
+Because `/requested_supervision_trajectories` has a new message type,
+`supervision_trajectory_manager_node` must be updated to subscribe to:
+
+```text
+deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
+```
+
+instead of:
+
+```text
 collision_detection/msg/DetectedCollisionTrajectoryArray
 ```
 
-```text
-/deconfliction_manager_markers
-visualization_msgs/msg/MarkerArray
-```
-
-## Configuration
-
-```yaml
-deconfliction_manager_node:
-  ros__parameters:
-    detected_collision_trajectories_topic: /detected_collision_trajectories
-
-    requested_supervision_trajectories_topic: /requested_supervision_trajectories
-    manual_adjustment_trajectories_topic: /manual_adjustment_trajectories
-
-    deconfliction_markers_topic: /deconfliction_manager_markers
-
-    collision_resource_threshold: 5
-    publish_period_ms: 1000
-
-    supervision_node_scale: 0.30
-    supervision_text_height: 0.28
-
-    manual_line_width: 0.14
-    manual_text_height: 0.36
-```
+It should consume `cropped_trajectory` directly rather than recomputing the crop
+from the original sparse `StaticTrajectory`.
 
 ## Build
 
@@ -222,43 +276,24 @@ rm -rf build/deconfliction_manager
 rm -rf install/deconfliction_manager
 
 colcon build --symlink-install \
-  --packages-select deconfliction_manager
+  --packages-up-to deconfliction_manager
 
 source install/setup.bash
 ```
 
-## Verify topic types
+## Check topics
 
 ```bash
 ros2 topic info /requested_supervision_trajectories
 ros2 topic info /manual_adjustment_trajectories
 ```
 
-Both should report:
+Expected:
 
 ```text
+/requested_supervision_trajectories
+Type: deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
+
+/manual_adjustment_trajectories
 Type: collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-## Downstream compatibility
-
-`supervision_trajectory_manager_node` is directly compatible with the new
-`/requested_supervision_trajectories` type.
-
-Any node currently subscribing to `/manual_adjustment_trajectories` as:
-
-```text
-static_trajectory_manager/msg/StaticTrajectoryArray
-```
-
-must be updated to consume:
-
-```text
-collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-and access the embedded static trajectory as:
-
-```cpp
-detected.trajectory
 ```

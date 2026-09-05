@@ -1,0 +1,831 @@
+--- supervision_node_previous.cpp
++++ src/supervision_node.cpp
+@@ -63,7 +63,19 @@
+   VehicleZoneStatus last_status;
+   std::chrono::steady_clock::time_point last_status_at{};
+ 
++  // Last PAUSE/RESUME command dispatched and last one positively
++  // acknowledged by the SupervisionControl action server.
+   int last_control_command{-1};
++  int last_confirmed_control_command{-1};
++  bool control_command_in_flight{false};
++};
++
++enum class PairMode : uint8_t
++{
++  PRIMARY_SUPERVISED_CONTROL = 0U,
++  WAITING_COUNTERPART_PAUSE = 1U,
++  COUNTERPART_HELD_FOR_CLEARANCE = 2U,
++  CLEARED = 3U
+ };
+ 
+ struct PairState
+@@ -73,9 +85,25 @@
+   std::string supervised_uas;
+   std::string counterpart_uas;
+ 
++  PairMode mode{PairMode::PRIMARY_SUPERVISED_CONTROL};
++
+   bool initial_pause_cycle_done{false};
++
++  // Used while the supervised UAS is the primary controlled vehicle.
++  bool progress_window_active{false};
++  double progress_reference_distance_m{std::numeric_limits<double>::infinity()};
++  std::chrono::steady_clock::time_point progress_reference_at{};
++
++  // Once escalation occurs, the non-supervised counterpart becomes a
++  // controlled/paused vehicle until the supervised UAS clears the collision
++  // geometry.
++  bool counterpart_control_engaged{false};
++  bool collision_region_seen{false};
++  std::chrono::steady_clock::time_point clearance_started_at{};
++
+   bool status_valid{false};
+   double distance_m{std::numeric_limits<double>::infinity()};
++  double collision_region_distance_m{std::numeric_limits<double>::infinity()};
+ };
+ 
+ static std::string trim_slashes(std::string value)
+@@ -137,6 +165,24 @@
+     security_distance_m_ = declare_parameter<double>("security_distance_m", 1.0);
+     use_3d_distance_ = declare_parameter<bool>("use_3d_distance", true);
+     zone_status_timeout_s_ = declare_parameter<double>("zone_status_timeout_s", 2.0);
++
++    // Escalation of a supervised pair:
++    // If the separation does not increase by at least this amount within the
++    // configured time window while the supervised UAS is paused, the
++    // non-supervised counterpart is paused and the supervised UAS is resumed.
++    distance_progress_timeout_s_ =
++      declare_parameter<double>("distance_progress_timeout_s", 0.5);
++    distance_progress_epsilon_m_ =
++      declare_parameter<double>("distance_progress_epsilon_m", 0.05);
++
++    // The supervised UAS is considered outside the original collision section
++    // when its minimum distance to every stored collision node/segment exceeds
++    // collision_exit_distance_m + collision_exit_hysteresis_m.
++    collision_exit_distance_m_ =
++      declare_parameter<double>("collision_exit_distance_m", 1.0);
++    collision_exit_hysteresis_m_ =
++      declare_parameter<double>("collision_exit_hysteresis_m", 0.20);
++
+     evaluation_period_ms_ = declare_parameter<int>("evaluation_period_ms", 100);
+     action_wait_timeout_ms_ = declare_parameter<int>("action_wait_timeout_ms", 20);
+ 
+@@ -175,9 +221,12 @@
+     RCLCPP_INFO(
+       get_logger(),
+       "[/%s] supervision_node ready | available='%s' | supervised='%s' | active='%s' | "
+-      "security_distance=%.3f m | action_suffix='%s'",
++      "security_distance=%.3f m | progress_timeout=%.2f s | progress_epsilon=%.3f m | "
++      "collision_exit=%.3f+%.3f m | action_suffix='%s'",
+       flight_zone_id_.c_str(), available_topic_.c_str(), supervised_topic_.c_str(),
+-      active_topic_.c_str(), security_distance_m_, control_action_suffix_.c_str());
++      active_topic_.c_str(), security_distance_m_, distance_progress_timeout_s_,
++      distance_progress_epsilon_m_, collision_exit_distance_m_,
++      collision_exit_hysteresis_m_, control_action_suffix_.c_str());
+   }
+ 
+ private:
+@@ -205,6 +254,20 @@
+ 
+     if (!std::isfinite(zone_status_timeout_s_) || zone_status_timeout_s_ <= 0.0) {
+       throw std::runtime_error("zone_status_timeout_s must be finite and > 0");
++    }
++
++    if (!std::isfinite(distance_progress_timeout_s_) || distance_progress_timeout_s_ <= 0.0 ||
++      !std::isfinite(distance_progress_epsilon_m_) || distance_progress_epsilon_m_ < 0.0)
++    {
++      throw std::runtime_error(
++              "distance_progress_timeout_s must be > 0 and distance_progress_epsilon_m must be >= 0");
++    }
++
++    if (!std::isfinite(collision_exit_distance_m_) || collision_exit_distance_m_ < 0.0 ||
++      !std::isfinite(collision_exit_hysteresis_m_) || collision_exit_hysteresis_m_ < 0.0)
++    {
++      throw std::runtime_error(
++              "collision exit distance/hysteresis must be finite and >= 0");
+     }
+ 
+     if (evaluation_period_ms_ <= 0 || action_wait_timeout_ms_ < 0) {
+@@ -453,6 +516,17 @@
+           std::lock_guard<std::mutex> lock(mutex_);
+           if (command == SupervisionControl::Goal::EXECUTE && !occurrence.empty()) {
+             execute_dispatched_.erase(occurrence);
++          } else if (
++            command == SupervisionControl::Goal::PAUSE ||
++            command == SupervisionControl::Goal::RESUME)
++          {
++            const auto it = drones_.find(trim_slashes(uas_namespace));
++            if (it != drones_.end()) {
++              if (it->second.last_control_command == static_cast<int>(command)) {
++                it->second.last_control_command = -1;
++              }
++              it->second.control_command_in_flight = false;
++            }
+           }
+           return;
+         }
+@@ -469,6 +543,18 @@
+           result.result->accepted;
+ 
+         if (success) {
++          if (
++            command == SupervisionControl::Goal::PAUSE ||
++            command == SupervisionControl::Goal::RESUME)
++          {
++            std::lock_guard<std::mutex> lock(mutex_);
++            const auto it = drones_.find(trim_slashes(uas_namespace));
++            if (it != drones_.end()) {
++              it->second.last_confirmed_control_command =
++                static_cast<int>(command);
++              it->second.control_command_in_flight = false;
++            }
++          }
+           return;
+         }
+ 
+@@ -481,8 +567,11 @@
+           execute_dispatched_.erase(occurrence);
+         } else if (command == SupervisionControl::Goal::PAUSE || command == SupervisionControl::Goal::RESUME) {
+           const auto it = drones_.find(trim_slashes(uas_namespace));
+-          if (it != drones_.end() && it->second.last_control_command == static_cast<int>(command)) {
+-            it->second.last_control_command = -1;
++          if (it != drones_.end()) {
++            if (it->second.last_control_command == static_cast<int>(command)) {
++              it->second.last_control_command = -1;
++            }
++            it->second.control_command_in_flight = false;
+           }
+         }
+       };
+@@ -493,6 +582,7 @@
+       execute_dispatched_.insert(occurrence);
+     } else if (command == SupervisionControl::Goal::PAUSE || command == SupervisionControl::Goal::RESUME) {
+       context_it->second.last_control_command = static_cast<int>(command);
++      context_it->second.control_command_in_flight = true;
+     }
+   }
+ 
+@@ -512,6 +602,20 @@
+     send_action_locked(uas_namespace, command, nullptr, reason);
+   }
+ 
++  bool control_command_confirmed_locked(
++    const std::string & uas_namespace,
++    uint8_t command) const
++  {
++    const auto it = drones_.find(trim_slashes(uas_namespace));
++    if (it == drones_.end()) {
++      return false;
++    }
++
++    return
++      it->second.last_confirmed_control_command ==
++      static_cast<int>(command);
++  }
++
+   bool fresh_status_locked(const std::string & uas_namespace, const VehicleZoneStatus *& output) const
+   {
+     const auto it = drones_.find(trim_slashes(uas_namespace));
+@@ -538,6 +642,97 @@
+     const double dy = first.position.y - second.position.y;
+     const double dz = use_3d_distance_ ? first.position.z - second.position.z : 0.0;
+     return std::sqrt(dx * dx + dy * dy + dz * dz);
++  }
++
++  double point_distance(
++    const geometry_msgs::msg::Point & first,
++    const geometry_msgs::msg::Point & second) const
++  {
++    const double dx = first.x - second.x;
++    const double dy = first.y - second.y;
++    const double dz = use_3d_distance_ ? first.z - second.z : 0.0;
++    return std::sqrt(dx * dx + dy * dy + dz * dz);
++  }
++
++  double point_segment_distance(
++    const geometry_msgs::msg::Point & point,
++    const geometry_msgs::msg::Point & start,
++    const geometry_msgs::msg::Point & end) const
++  {
++    const double sx = start.x;
++    const double sy = start.y;
++    const double sz = use_3d_distance_ ? start.z : 0.0;
++
++    const double ex = end.x;
++    const double ey = end.y;
++    const double ez = use_3d_distance_ ? end.z : 0.0;
++
++    const double px = point.x;
++    const double py = point.y;
++    const double pz = use_3d_distance_ ? point.z : 0.0;
++
++    const double vx = ex - sx;
++    const double vy = ey - sy;
++    const double vz = ez - sz;
++
++    const double wx = px - sx;
++    const double wy = py - sy;
++    const double wz = pz - sz;
++
++    const double vv = vx * vx + vy * vy + vz * vz;
++    if (vv <= 1.0e-12) {
++      const double dx = px - sx;
++      const double dy = py - sy;
++      const double dz = pz - sz;
++      return std::sqrt(dx * dx + dy * dy + dz * dz);
++    }
++
++    const double projection =
++      std::clamp((wx * vx + wy * vy + wz * vz) / vv, 0.0, 1.0);
++
++    const double cx = sx + projection * vx;
++    const double cy = sy + projection * vy;
++    const double cz = sz + projection * vz;
++
++    const double dx = px - cx;
++    const double dy = py - cy;
++    const double dz = pz - cz;
++    return std::sqrt(dx * dx + dy * dy + dz * dz);
++  }
++
++  double distance_to_collision_region(
++    const DetectedCollisionTrajectory & detected,
++    const geometry_msgs::msg::Point & position) const
++  {
++    double best = std::numeric_limits<double>::infinity();
++
++    for (const auto & node : detected.collision_nodes) {
++      best = std::min(best, point_distance(position, node.position));
++    }
++
++    for (const auto & segment : detected.collision_segments) {
++      best = std::min(
++        best,
++        point_segment_distance(position, segment.start, segment.end));
++    }
++
++    return best;
++  }
++
++  static const char * pair_mode_name(PairMode mode)
++  {
++    switch (mode) {
++      case PairMode::PRIMARY_SUPERVISED_CONTROL:
++        return "PRIMARY_SUPERVISED_CONTROL";
++      case PairMode::WAITING_COUNTERPART_PAUSE:
++        return "WAITING_COUNTERPART_PAUSE";
++      case PairMode::COUNTERPART_HELD_FOR_CLEARANCE:
++        return "COUNTERPART_HELD_FOR_CLEARANCE";
++      case PairMode::CLEARED:
++        return "CLEARED";
++      default:
++        return "UNKNOWN";
++    }
+   }
+ 
+   void dispatch_active_trajectories_locked()
+@@ -590,8 +785,14 @@
+   void evaluate_supervised_pairs_locked()
+   {
+     std::map<std::string, PairState> next_pairs;
+-    std::set<std::string> supervised_uas_seen;
++
++    // Only UAS that have actually entered the supervision-control sequence are
++    // included here. PAUSE always dominates RESUME if one UAS participates in
++    // several simultaneous pairs.
++    std::set<std::string> controlled_uas_seen;
+     std::set<std::string> uas_requiring_pause;
++
++    const auto steady_now = std::chrono::steady_clock::now();
+ 
+     for (const auto & [supervised_id, detected] : supervised_) {
+       const auto supervised_active_it = active_.find(supervised_id);
+@@ -605,24 +806,29 @@
+           continue;
+         }
+ 
+-        // This node controls the UAS that executes the supervised trajectory.
+-        // The non-supervised counterpart keeps executing its own trajectory.
++        // The counterpart in this pair must be non-supervised. Two supervised
++        // trajectories are not arbitrated by this specific state machine.
+         if (supervised_.find(counterpart_id) != supervised_.end()) {
+           continue;
+         }
+ 
+-        const std::string supervised_uas = trim_slashes(detected.trajectory.uas_namespace);
+-        const std::string counterpart_uas = trim_slashes(counterpart_active_it->second.uas_namespace);
+-        if (supervised_uas.empty() || counterpart_uas.empty() || supervised_uas == counterpart_uas) {
++        const std::string supervised_uas =
++          trim_slashes(detected.trajectory.uas_namespace);
++        const std::string counterpart_uas =
++          trim_slashes(counterpart_active_it->second.uas_namespace);
++
++        if (supervised_uas.empty() || counterpart_uas.empty() ||
++          supervised_uas == counterpart_uas)
++        {
+           continue;
+         }
+ 
+         ensure_drone_context_locked(supervised_uas);
+         ensure_drone_context_locked(counterpart_uas);
+-        supervised_uas_seen.insert(supervised_uas);
+ 
+         const std::string pair_key = supervised_id + "|" + counterpart_id;
+         PairState state;
++
+         const auto previous_it = pair_states_.find(pair_key);
+         if (previous_it != pair_states_.end()) {
+           state = previous_it->second;
+@@ -634,72 +840,370 @@
+         state.counterpart_uas = counterpart_uas;
+         state.status_valid = false;
+         state.distance_m = std::numeric_limits<double>::infinity();
+-
+-        // First cycle: pause the UAS that executes the supervised trajectory
+-        // before making any release decision.
++        state.collision_region_distance_m =
++          std::numeric_limits<double>::infinity();
++
++        // The supervised UAS is always part of this control sequence.
++        controlled_uas_seen.insert(supervised_uas);
++
++        if (state.counterpart_control_engaged) {
++          controlled_uas_seen.insert(counterpart_uas);
++        }
++
++        // Step 1. Always begin by pausing the UAS executing the supervised
++        // trajectory for at least one evaluation cycle. This also preserves the
++        // deterministic PAUSE-before-release behavior of the previous node.
+         if (!state.initial_pause_cycle_done) {
+           uas_requiring_pause.insert(supervised_uas);
+           state.initial_pause_cycle_done = true;
++          state.progress_window_active = false;
++
+           next_pairs[pair_key] = state;
+           continue;
+         }
+ 
+         const VehicleZoneStatus * supervised_status = nullptr;
+         const VehicleZoneStatus * counterpart_status = nullptr;
+-        const bool first_fresh = fresh_status_locked(supervised_uas, supervised_status);
+-        const bool second_fresh = fresh_status_locked(counterpart_uas, counterpart_status);
+-
+-        if (!first_fresh || !second_fresh || supervised_status == nullptr || counterpart_status == nullptr) {
+-          // Fail-safe: lack of a current position never authorizes RESUME of
+-          // the supervised UAS.
++
++        const bool supervised_fresh =
++          fresh_status_locked(supervised_uas, supervised_status);
++        const bool counterpart_fresh =
++          fresh_status_locked(counterpart_uas, counterpart_status);
++
++        const bool statuses_valid =
++          supervised_fresh &&
++          counterpart_fresh &&
++          supervised_status != nullptr &&
++          counterpart_status != nullptr &&
++          supervised_status->header.frame_id ==
++          counterpart_status->header.frame_id;
++
++        if (statuses_valid) {
++          state.status_valid = true;
++          state.distance_m =
++            vehicle_distance(*supervised_status, *counterpart_status);
++        }
++
++        // ------------------------------------------------------------------
++        // PHASE 1: normal supervision of the supervised UAS.
++        // ------------------------------------------------------------------
++        if (state.mode == PairMode::PRIMARY_SUPERVISED_CONTROL) {
++          if (!statuses_valid) {
++            // Fail safe while the primary measure is active: no fresh pair
++            // position means the supervised UAS cannot be released.
++            uas_requiring_pause.insert(supervised_uas);
++            state.progress_window_active = false;
++
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          if (state.distance_m > security_distance_m_) {
++            // Normal PAUSE/RESUME supervision: sufficient separation releases
++            // the supervised UAS.
++            state.progress_window_active = false;
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          // At/below the security threshold the supervised UAS is paused.
++          // We then observe whether the separation actually improves.
++          bool escalate = false;
++
++          if (!state.progress_window_active) {
++            state.progress_window_active = true;
++            state.progress_reference_distance_m = state.distance_m;
++            state.progress_reference_at = steady_now;
++          } else if (
++            state.distance_m >=
++            state.progress_reference_distance_m +
++            distance_progress_epsilon_m_)
++          {
++            // Separation is growing: the primary measure is working. Start a
++            // fresh progress window from the improved distance.
++            state.progress_reference_distance_m = state.distance_m;
++            state.progress_reference_at = steady_now;
++          } else {
++            const double elapsed_s = std::chrono::duration<double>(
++              steady_now - state.progress_reference_at).count();
++
++            if (elapsed_s >= distance_progress_timeout_s_) {
++              escalate = true;
++            }
++          }
++
++          if (!escalate) {
++            uas_requiring_pause.insert(supervised_uas);
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          // ----------------------------------------------------------------
++          // Step 2 + 3:
++          // The first measure is not creating increasing separation.
++          // Pause the non-supervised counterpart and RESUME the supervised UAS.
++          // ----------------------------------------------------------------
++          state.mode = PairMode::WAITING_COUNTERPART_PAUSE;
++          state.counterpart_control_engaged = true;
++          state.progress_window_active = false;
++          state.clearance_started_at = steady_now;
++
++          controlled_uas_seen.insert(counterpart_uas);
++
++          // Strict command ordering: keep S paused until N has positively
++          // acknowledged the PAUSE action.
+           uas_requiring_pause.insert(supervised_uas);
++          uas_requiring_pause.insert(counterpart_uas);
++
++          const std::string collision_frame =
++            trim_slashes(detected.trajectory.frame_id);
++          const std::string status_frame =
++            trim_slashes(supervised_status->header.frame_id);
++
++          if (!collision_frame.empty() && collision_frame == status_frame) {
++            state.collision_region_distance_m =
++              distance_to_collision_region(
++              detected,
++              supervised_status->position);
++
++            if (
++              std::isfinite(state.collision_region_distance_m) &&
++              state.collision_region_distance_m <=
++              collision_exit_distance_m_)
++            {
++              state.collision_region_seen = true;
++            }
++          }
++
++          RCLCPP_WARN(
++            get_logger(),
++            "[/%s] Escalating supervised pair '%s' <-> '%s': "
++            "separation did not improve by %.3f m within %.2f s. "
++            "request PAUSE counterpart UAS '%s'; supervised UAS '%s' remains PAUSED until acknowledgement.",
++            flight_zone_id_.c_str(),
++            supervised_id.c_str(),
++            counterpart_id.c_str(),
++            distance_progress_epsilon_m_,
++            distance_progress_timeout_s_,
++            counterpart_uas.c_str(),
++            supervised_uas.c_str());
++
+           next_pairs[pair_key] = state;
+           continue;
+         }
+ 
+-        if (supervised_status->header.frame_id != counterpart_status->header.frame_id) {
+-          uas_requiring_pause.insert(supervised_uas);
++        // ------------------------------------------------------------------
++        // ESCALATION BARRIER:
++        // Request PAUSE on the counterpart first. S remains PAUSED until the
++        // counterpart's control_manager positively acknowledges that command.
++        // ------------------------------------------------------------------
++        if (state.mode == PairMode::WAITING_COUNTERPART_PAUSE) {
++          state.counterpart_control_engaged = true;
++          controlled_uas_seen.insert(counterpart_uas);
++
++          const bool counterpart_pause_confirmed =
++            control_command_confirmed_locked(
++            counterpart_uas,
++            SupervisionControl::Goal::PAUSE);
++
++          // N must remain paused in either case.
++          uas_requiring_pause.insert(counterpart_uas);
++
++          if (!counterpart_pause_confirmed) {
++            // Until PAUSE is acknowledged for N, S also remains paused.
++            uas_requiring_pause.insert(supervised_uas);
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          state.mode = PairMode::COUNTERPART_HELD_FOR_CLEARANCE;
++
++          RCLCPP_WARN(
++            get_logger(),
++            "[/%s] Counterpart UAS '%s' accepted PAUSE for pair '%s' <-> '%s'. "
++            "RESUME supervised UAS '%s' so it can clear the collision section.",
++            flight_zone_id_.c_str(),
++            counterpart_uas.c_str(),
++            supervised_id.c_str(),
++            counterpart_id.c_str(),
++            supervised_uas.c_str());
++
+           next_pairs[pair_key] = state;
+           continue;
+         }
+ 
+-        state.status_valid = true;
+-        state.distance_m = vehicle_distance(*supervised_status, *counterpart_status);
+-
+-        if (state.distance_m <= security_distance_m_) {
+-          uas_requiring_pause.insert(supervised_uas);
+-        }
+-
+-        next_pairs[pair_key] = state;
+-      }
+-    }
+-
+-    // A supervised UAS is resumed only if NONE of its currently active
+-    // conflict pairs requires it to remain paused.
+-    for (const auto & uas : supervised_uas_seen) {
+-      const bool must_pause = uas_requiring_pause.count(uas) != 0U;
+-      std::ostringstream reason;
+-      if (must_pause) {
+-        reason << "supervised UAS conflict: keep supervised trajectory PAUSED while distance <= "
+-               << security_distance_m_ << " m or status is unavailable";
+-      } else {
+-        reason << "supervised UAS conflict cleared: pair distance > "
+-               << security_distance_m_ << " m";
+-      }
+-      ensure_control_state_locked(uas, must_pause, reason.str());
+-    }
+-
+-    // If a previously controlled supervised UAS is no longer part of any
+-    // active supervised pair, release it.
+-    std::set<std::string> previous_supervised_uas;
+-    for (const auto & [_, state] : pair_states_) {
+-      if (!state.supervised_uas.empty()) {
+-        previous_supervised_uas.insert(state.supervised_uas);
+-      }
+-    }
+-    for (const auto & uas : previous_supervised_uas) {
+-      if (supervised_uas_seen.count(uas) == 0U) {
+-        ensure_control_state_locked(uas, false, "no active supervised conflict pair remains");
++        // ------------------------------------------------------------------
++        // PHASE 2: counterpart held, supervised UAS is allowed to traverse the
++        // original collision section.
++        // ------------------------------------------------------------------
++        if (state.mode == PairMode::COUNTERPART_HELD_FOR_CLEARANCE) {
++          state.counterpart_control_engaged = true;
++          controlled_uas_seen.insert(counterpart_uas);
++
++          // The non-supervised UAS remains paused throughout this phase.
++          uas_requiring_pause.insert(counterpart_uas);
++
++          // No PAUSE is requested for supervised_uas here, therefore the
++          // aggregation below sends/maintains RESUME for it.
++
++          if (!statuses_valid) {
++            // We cannot prove that the supervised UAS has cleared the original
++            // collision section. Keep the counterpart frozen.
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          const std::string collision_frame =
++            trim_slashes(detected.trajectory.frame_id);
++          const std::string status_frame =
++            trim_slashes(supervised_status->header.frame_id);
++
++          if (collision_frame.empty() || collision_frame != status_frame) {
++            RCLCPP_WARN_THROTTLE(
++              get_logger(),
++              *get_clock(),
++              2000,
++              "[/%s] Cannot verify clearance of supervised trajectory '%s': "
++              "collision frame='%s', zone_status frame='%s'. Counterpart remains PAUSED.",
++              flight_zone_id_.c_str(),
++              supervised_id.c_str(),
++              collision_frame.c_str(),
++              status_frame.c_str());
++
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          state.collision_region_distance_m =
++            distance_to_collision_region(
++            detected,
++            supervised_status->position);
++
++          if (!std::isfinite(state.collision_region_distance_m)) {
++            RCLCPP_WARN_THROTTLE(
++              get_logger(),
++              *get_clock(),
++              2000,
++              "[/%s] Supervised trajectory '%s' has no usable collision nodes/segments; "
++              "counterpart '%s' remains PAUSED.",
++              flight_zone_id_.c_str(),
++              supervised_id.c_str(),
++              counterpart_id.c_str());
++
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          if (
++            state.collision_region_distance_m <=
++            collision_exit_distance_m_)
++          {
++            state.collision_region_seen = true;
++          }
++
++          const double release_distance =
++            collision_exit_distance_m_ +
++            collision_exit_hysteresis_m_;
++
++          if (
++            !state.collision_region_seen ||
++            state.collision_region_distance_m <= release_distance)
++          {
++            // The counterpart is released only after S has actually been
++            // observed in/near the collision region and subsequently moved
++            // beyond the release margin.
++            next_pairs[pair_key] = state;
++            continue;
++          }
++
++          // Step 4 + 5:
++          // The supervised UAS is now outside the complete set of original
++          // collision nodes/segments by the requested margin. The counterpart
++          // can be released.
++          state.mode = PairMode::CLEARED;
++
++          RCLCPP_INFO(
++            get_logger(),
++            "[/%s] Supervised trajectory '%s' cleared collision section | "
++            "distance_to_collision_geometry=%.3f m > %.3f m. "
++            "RESUME counterpart UAS '%s'.",
++            flight_zone_id_.c_str(),
++            supervised_id.c_str(),
++            state.collision_region_distance_m,
++            release_distance,
++            counterpart_uas.c_str());
++
++          next_pairs[pair_key] = state;
++          continue;
++        }
++
++        // ------------------------------------------------------------------
++        // PHASE 3: this pair has already been deconflicted. Both UAS remain
++        // released until one trajectory leaves /active_trajectories.
++        // ------------------------------------------------------------------
++        if (state.mode == PairMode::CLEARED) {
++          state.counterpart_control_engaged = true;
++          controlled_uas_seen.insert(counterpart_uas);
++
++          next_pairs[pair_key] = state;
++          continue;
++        }
++      }
++    }
++
++    // Aggregate all active pairs. PAUSE has precedence if one UAS participates
++    // in several pairs with different local decisions.
++    // Dispatch all PAUSE requests first. Only after those requests have been
++    // issued do we dispatch RESUME requests. The WAITING_COUNTERPART_PAUSE
++    // barrier additionally requires positive action acknowledgement before S
++    // can be resumed during an escalation.
++    for (const auto & uas : controlled_uas_seen) {
++      if (uas_requiring_pause.count(uas) == 0U) {
++        continue;
++      }
++
++      ensure_control_state_locked(
++        uas,
++        true,
++        "flight-zone supervised deconfliction requires PAUSE");
++    }
++
++    for (const auto & uas : controlled_uas_seen) {
++      if (uas_requiring_pause.count(uas) != 0U) {
++        continue;
++      }
++
++      ensure_control_state_locked(
++        uas,
++        false,
++        "flight-zone supervised deconfliction permits RESUME");
++    }
++
++    // Release UAS that were controlled by a previous pair but are no longer
++    // represented by any active supervised pair.
++    std::set<std::string> previously_controlled_uas;
++
++    for (const auto & [_, previous] : pair_states_) {
++      if (!previous.supervised_uas.empty()) {
++        previously_controlled_uas.insert(
++          previous.supervised_uas);
++      }
++
++      if (
++        previous.counterpart_control_engaged &&
++        !previous.counterpart_uas.empty())
++      {
++        previously_controlled_uas.insert(
++          previous.counterpart_uas);
++      }
++    }
++
++    for (const auto & uas : previously_controlled_uas) {
++      if (controlled_uas_seen.count(uas) == 0U) {
++        ensure_control_state_locked(
++          uas,
++          false,
++          "no active supervised conflict pair remains");
+       }
+     }
+ 
+@@ -853,11 +1357,57 @@
+       link.action = Marker::ADD;
+       link.pose.orientation.w = 1.0;
+       link.scale.x = 0.06;
+-      link.color = pair.status_valid && pair.distance_m > security_distance_m_ ?
+-        color(0.10F, 0.90F, 0.20F, 1.0F) : color(1.0F, 0.10F, 0.10F, 1.0F);
++      if (pair.mode == PairMode::WAITING_COUNTERPART_PAUSE) {
++        link.color = color(1.0F, 0.0F, 0.75F, 1.0F);
++      } else if (pair.mode == PairMode::COUNTERPART_HELD_FOR_CLEARANCE) {
++        link.color = color(1.0F, 0.55F, 0.0F, 1.0F);
++      } else if (pair.mode == PairMode::CLEARED) {
++        link.color = color(0.10F, 0.90F, 0.20F, 1.0F);
++      } else {
++        link.color = pair.status_valid && pair.distance_m > security_distance_m_ ?
++          color(0.10F, 0.90F, 0.20F, 1.0F) :
++          color(1.0F, 0.10F, 0.10F, 1.0F);
++      }
+       link.points.push_back(first_it->second.last_status.position);
+       link.points.push_back(second_it->second.last_status.position);
+       out.markers.push_back(std::move(link));
++
++      Marker text;
++      text.header = first_it->second.last_status.header;
++      text.header.stamp = now();
++      text.ns = "supervision/security_pair_labels";
++      text.id = marker_id++;
++      text.type = Marker::TEXT_VIEW_FACING;
++      text.action = Marker::ADD;
++      text.pose.orientation.w = 1.0;
++      text.pose.position.x =
++        0.5 * (
++        first_it->second.last_status.position.x +
++        second_it->second.last_status.position.x);
++      text.pose.position.y =
++        0.5 * (
++        first_it->second.last_status.position.y +
++        second_it->second.last_status.position.y);
++      text.pose.position.z =
++        0.5 * (
++        first_it->second.last_status.position.z +
++        second_it->second.last_status.position.z) +
++        text_height_;
++      text.scale.z = text_height_;
++      text.color = color(1.0F, 1.0F, 1.0F, 1.0F);
++
++      std::ostringstream pair_label;
++      pair_label << pair_mode_name(pair.mode);
++      if (pair.status_valid) {
++        pair_label << " | d=" << pair.distance_m << " m";
++      }
++      if (std::isfinite(pair.collision_region_distance_m)) {
++        pair_label << " | collision_d="
++                   << pair.collision_region_distance_m << " m";
++      }
++      text.text = pair_label.str();
++
++      out.markers.push_back(std::move(text));
+     }
+ 
+     return out;
+@@ -882,6 +1432,12 @@
+   double security_distance_m_{1.0};
+   bool use_3d_distance_{true};
+   double zone_status_timeout_s_{2.0};
++
++  double distance_progress_timeout_s_{0.5};
++  double distance_progress_epsilon_m_{0.05};
++  double collision_exit_distance_m_{1.0};
++  double collision_exit_hysteresis_m_{0.20};
++
+   int evaluation_period_ms_{100};
+   int action_wait_timeout_ms_{20};
+ 

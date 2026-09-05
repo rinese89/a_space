@@ -1,0 +1,338 @@
+--- supervision_trajectory_manager_node_v0.4.0.cpp
++++ src/supervision_trajectory_manager_node.cpp
+@@ -84,9 +84,13 @@
+   CroppedNetTrajectory crop;
+   bool crop_complete{false};
+ 
+-  // StaticTrajectory representation required by /adjusted_trajectories and
+-  // static_trajectory_manager. No collision decision is made here: this is
+-  // only a materialization of the already-cropped net geometry.
++  // True only when the complete upstream net crop can be represented EXACTLY
++  // by the legacy StaticTrajectory schema (one continuous polyline per phase).
++  // No fragment is discarded and no gap is reconnected.
++  bool adjusted_ready{false};
++
++  // Exact legacy representation used by /adjusted_trajectories when
++  // adjusted_ready=true.
+   StaticTrajectory adjusted;
+ 
+   StoredState state{StoredState::PENDING};
+@@ -103,7 +107,6 @@
+ {
+   std::vector<geometry_msgs::msg::Point> points;
+   double length_m{0.0};
+-  uint32_t first_net_segment_index{0U};
+ };
+ 
+ static std_msgs::msg::ColorRGBA color(
+@@ -339,8 +342,14 @@
+     const auto * previous =
+       current.back();
+ 
++    const bool consecutive_index =
++      previous != nullptr &&
++      segment->net_segment_index ==
++      previous->net_segment_index + 1U;
++
+     if (
+       previous != nullptr &&
++      consecutive_index &&
+       share_node(*previous, *segment))
+     {
+       current.push_back(segment);
+@@ -368,9 +377,6 @@
+   if (edges.empty() || edges.front() == nullptr) {
+     return output;
+   }
+-
+-  output.first_net_segment_index =
+-    edges.front()->net_segment_index;
+ 
+   const auto * first = edges.front();
+ 
+@@ -513,7 +519,7 @@
+   return output;
+ }
+ 
+-static TrajectorySegment materialize_phase(
++static TrajectorySegment materialize_phase_exact(
+   const CroppedNetTrajectory & crop,
+   const StaticTrajectory & original_trajectory,
+   uint8_t phase)
+@@ -523,60 +529,65 @@
+   const auto ordered =
+     phase_segments(crop, phase);
+ 
++  if (ordered.empty()) {
++    return output;
++  }
++
+   const auto runs =
+     split_runs(ordered);
++
++  std::vector<
++    std::vector<const NetTrajectorySegment *>>
++    non_empty_runs;
++
++  for (const auto & run : runs) {
++    if (!run.empty()) {
++      non_empty_runs.push_back(run);
++    }
++  }
++
++  if (non_empty_runs.empty()) {
++    return output;
++  }
++
++  // CRITICAL:
++  // StaticTrajectory/TrajectorySegment can encode only ONE continuous
++  // polyline per phase. If the exact upstream crop contains two or more
++  // disconnected retained pieces, selecting one of them (the old behavior)
++  // would modify the trajectory. Joining them would be even worse because it
++  // would create an artificial segment across the removed collision region.
++  //
++  // Therefore an exact conversion is possible only when the phase contains at
++  // most one continuous retained run.
++  if (non_empty_runs.size() != 1U) {
++    std::ostringstream error;
++    error
++      << "phase=" << static_cast<unsigned int>(phase)
++      << " contains " << non_empty_runs.size()
++      << " disconnected retained net runs; legacy TrajectorySegment cannot "
++      << "represent this crop exactly";
++    throw std::runtime_error(error.str());
++  }
+ 
+   const TrajectorySegment & original =
+     original_phase(
+     original_trajectory,
+     phase);
+ 
+-  const NetRun * best = nullptr;
+-  std::vector<NetRun> materialized;
+-  materialized.reserve(runs.size());
+-
+-  for (const auto & run_edges : runs) {
+-    materialized.push_back(
+-      materialize_run(
+-        run_edges,
+-        original));
+-
+-    const NetRun & candidate =
+-      materialized.back();
+-
+-    if (candidate.points.size() < 2U) {
+-      continue;
+-    }
+-
+-    if (
+-      best == nullptr ||
+-      candidate.length_m >
+-      best->length_m + 1.0e-9 ||
+-      (
+-        std::abs(
+-          candidate.length_m -
+-          best->length_m) <= 1.0e-9 &&
+-        candidate.first_net_segment_index <
+-        best->first_net_segment_index))
+-    {
+-      best = &candidate;
+-    }
+-  }
+-
+-  if (best == nullptr) {
++  const NetRun run =
++    materialize_run(
++    non_empty_runs.front(),
++    original);
++
++  if (run.points.size() < 2U) {
+     return output;
+   }
+ 
+-  output.x.reserve(
+-    best->points.size());
+-  output.y.reserve(
+-    best->points.size());
+-  output.z.reserve(
+-    best->points.size());
+-
+-  for (const auto & point :
+-    best->points)
+-  {
++  output.x.reserve(run.points.size());
++  output.y.reserve(run.points.size());
++  output.z.reserve(run.points.size());
++
++  for (const auto & point : run.points) {
+     output.x.push_back(point.x);
+     output.y.push_back(point.y);
+     output.z.push_back(point.z);
+@@ -625,23 +636,22 @@
+   // survive. This node only converts those retained edges into the legacy
+   // StaticTrajectory representation required by /adjusted_trajectories.
+   //
+-  // Because one TrajectorySegment cannot represent multiple disconnected
+-  // pieces, the longest continuous retained run of each phase is selected.
+-  // No removed edge is ever crossed/reconnected.
++  // This conversion is allowed only if each phase is already one continuous
++  // retained run. The node NEVER selects a subset and NEVER reconnects a gap.
+   output.takeoff =
+-    materialize_phase(
++    materialize_phase_exact(
+     crop,
+     detected.trajectory,
+     kTakeoff);
+ 
+   output.mission =
+-    materialize_phase(
++    materialize_phase_exact(
+     crop,
+     detected.trajectory,
+     kMission);
+ 
+   output.landing =
+-    materialize_phase(
++    materialize_phase_exact(
+     crop,
+     detected.trajectory,
+     kLanding);
+@@ -1027,6 +1037,7 @@
+         entry.request = request;
+         entry.crop = crop;
+         entry.crop_complete = false;
++        entry.adjusted_ready = false;
+         entry.state = StoredState::PENDING;
+         entry.synchronized_start_utc =
+           request.trajectory.operation_start_utc;
+@@ -1057,18 +1068,24 @@
+     }
+ 
+     StaticTrajectory new_adjusted;
++    bool adjusted_ready = false;
+ 
+     try {
+       new_adjusted =
+         materialize_adjusted(message);
++      adjusted_ready = true;
+     } catch (const std::exception & error) {
+-      RCLCPP_ERROR(
++      // Preserve the exact upstream crop, but do NOT invent a different
++      // StaticTrajectory. A disconnected crop requires a richer downstream
++      // trajectory representation before it can be sent to /adjusted_trajectories.
++      RCLCPP_ERROR_THROTTLE(
+         get_logger(),
+-        "Cannot acquire cropped supervision trajectory '%s': %s",
++        *get_clock(),
++        3000,
++        "Supervision crop '%s' cannot be represented exactly as StaticTrajectory: %s. "
++        "Nothing will be published on /adjusted_trajectories for this entry.",
+         id.c_str(),
+         error.what());
+-
+-      return;
+     }
+ 
+     if (existing == stored_.end()) {
+@@ -1076,8 +1093,12 @@
+       entry.request = request;
+       entry.crop = crop;
+       entry.crop_complete = true;
+-      entry.adjusted =
+-        std::move(new_adjusted);
++      entry.adjusted_ready =
++        adjusted_ready;
++      if (adjusted_ready) {
++        entry.adjusted =
++          std::move(new_adjusted);
++      }
+       entry.state =
+         StoredState::PENDING;
+       entry.synchronized_start_utc =
+@@ -1093,20 +1114,27 @@
+         get_logger(),
+         "Stored supervision request '%s' from upstream crop | "
+         "collision_nodes=%zu | collision_segments=%zu | "
+-        "retained_net_segments=%zu",
++        "retained_net_segments=%zu | adjusted_ready=%s",
+         id.c_str(),
+         request.collision_nodes.size(),
+         request.collision_segments.size(),
+-        crop.retained_segments.size());
++        crop.retained_segments.size(),
++        adjusted_ready ? "true" : "false");
+ 
+       return;
+     }
+ 
+     const bool geometry_changed =
+-      !existing->second.crop_complete ||
+-      !same_geometry(
+-        existing->second.adjusted,
+-        new_adjusted);
++      existing->second.adjusted_ready != adjusted_ready ||
++      (
++        adjusted_ready &&
++        (
++          !existing->second.crop_complete ||
++          !same_geometry(
++            existing->second.adjusted,
++            new_adjusted)
++        )
++      );
+ 
+     const auto synchronized_start =
+       existing->second.synchronized_start_utc;
+@@ -1118,10 +1146,20 @@
+     existing->second.request = request;
+     existing->second.crop = crop;
+     existing->second.crop_complete = true;
++    existing->second.adjusted_ready =
++      adjusted_ready;
+ 
+     if (geometry_changed) {
+-      existing->second.adjusted =
+-        std::move(new_adjusted);
++      if (adjusted_ready) {
++        existing->second.adjusted =
++          std::move(new_adjusted);
++      } else {
++        // Clear any previous materialization so an old geometry can never be
++        // republished after the authoritative upstream crop became
++        // non-representable.
++        existing->second.adjusted =
++          StaticTrajectory{};
++      }
+       existing->second.state =
+         StoredState::PENDING;
+       existing->second.synchronized_start_utc =
+@@ -1143,6 +1181,7 @@
+     // periodic time window. Preserve a newer window already learned from
+     // /available_static_trajectories.
+     if (
++      adjusted_ready &&
+       synchronized_received &&
+       periodic(
+         existing->second.request.trajectory))
+@@ -1231,7 +1270,10 @@
+     }
+ 
+     for (auto & [id, entry] : stored_) {
+-      if (!entry.crop_complete) {
++      if (
++        !entry.crop_complete ||
++        !entry.adjusted_ready)
++      {
+         continue;
+       }
+ 
+@@ -1315,7 +1357,8 @@
+       if (
+         entry.state ==
+         StoredState::PENDING &&
+-        entry.crop_complete)
++        entry.crop_complete &&
++        entry.adjusted_ready)
+       {
+         ordered.push_back(&entry);
+       }

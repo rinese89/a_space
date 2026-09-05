@@ -1,4 +1,5 @@
-# Operator control over the currently scheduled/executing trajectory.
+# Operator/manual control over the currently scheduled/executing trajectory.
+
 uint8 PAUSE=0
 uint8 RESUME=1
 uint8 STOP=2

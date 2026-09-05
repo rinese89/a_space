@@ -5,9 +5,13 @@ supervision_trajectory_manager_node:
     adjusted_trajectories_topic: /adjusted_trajectories
     supervised_trajectories_topic: /supervised_trajectories
     supervision_markers_topic: /supervision_trajectory_manager_markers
+
     publish_period_ms: 1000
-    node_position_tolerance_m: 0.75
+
+    # Used only to confirm that the StaticTrajectory representation injected
+    # through /adjusted_trajectories is the one currently stored in AVAILABLE.
     geometry_match_tolerance_m: 0.000001
+
     pending_line_width: 0.12
     supervised_node_scale: 0.32
     supervised_text_height: 0.28

@@ -7,11 +7,16 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+
+find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(static_trajectory_manager REQUIRED)
+
+find_package(a_space_virtual_net REQUIRED)
 find_package(collision_detection REQUIRED)
+find_package(deconfliction_manager REQUIRED)
+find_package(static_trajectory_manager REQUIRED)
 
 add_executable(
   supervision_trajectory_manager_node
@@ -21,11 +26,14 @@ add_executable(
 ament_target_dependencies(
   supervision_trajectory_manager_node
   rclcpp
+  builtin_interfaces
   geometry_msgs
   std_msgs
   visualization_msgs
-  static_trajectory_manager
+  a_space_virtual_net
   collision_detection
+  deconfliction_manager
+  static_trajectory_manager
 )
 
 target_compile_features(

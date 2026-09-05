@@ -18,9 +18,11 @@ Panels:
         - /MarkerArray6
         - /MarkerArray7
         - /MarkerArray8
+        - /MarkerArray9
         - /MarkerArray10
         - /MarkerArray11
         - /MarkerArray11/Namespaces1
+        - /MarkerArray12
       Splitter Ratio: 0.6213114857673645
     Tree Height: 719
   - Class: rviz_common/Selection
@@ -199,7 +201,7 @@ Visualization Manager:
         Value: /inspection_1/ua_ins_2/zone_status/markers
       Value: false
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
+      Enabled: true
       Name: MarkerArray
       Namespaces:
         {}
@@ -209,7 +211,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /active_trajectories_markers
-      Value: false
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
       Name: MarkerArray
@@ -223,7 +225,7 @@ Visualization Manager:
         Value: /collision_trajectories/inspection_1/intersection_mission_markers
       Value: false
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: MarkerArray
       Namespaces:
         {}
@@ -233,9 +235,9 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /detected_collision_trajectories_markers
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: MarkerArray
       Namespaces:
         {}
@@ -245,7 +247,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /deconfliction_manager_markers
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: MarkerArray
@@ -304,7 +306,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/XYOrbit
-      Distance: 24.752939224243164
+      Distance: 25.029699325561523
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

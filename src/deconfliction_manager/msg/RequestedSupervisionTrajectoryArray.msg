@@ -1,0 +1,2 @@
+std_msgs/Header header
+deconfliction_manager/RequestedSupervisionTrajectory[] trajectories

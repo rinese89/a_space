@@ -1,6 +1,8 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <px4_msgs/msg/vehicle_status.hpp>
+#include <collision_detection/msg/detected_collision_trajectory.hpp>
+#include <collision_detection/msg/detected_collision_trajectory_array.hpp>
 #include <static_trajectory_manager/msg/static_trajectory.hpp>
 #include <static_trajectory_manager/msg/static_trajectory_array.hpp>
 #include <static_trajectory_manager/msg/trajectory_segment.hpp>
@@ -40,6 +42,8 @@ namespace trajectory_server_pkg
 {
 
 using VehicleStatus = px4_msgs::msg::VehicleStatus;
+using DetectedCollisionTrajectory = collision_detection::msg::DetectedCollisionTrajectory;
+using DetectedCollisionTrajectoryArray = collision_detection::msg::DetectedCollisionTrajectoryArray;
 using StaticTrajectory = static_trajectory_manager::msg::StaticTrajectory;
 using StaticTrajectoryArray = static_trajectory_manager::msg::StaticTrajectoryArray;
 using TrajectorySegment = static_trajectory_manager::msg::TrajectorySegment;
@@ -266,7 +270,8 @@ static geometry_msgs::msg::Point to_point(const Vec3 & value)
 static std::vector<Vec3> segment_points(
   const TrajectorySegment & segment,
   const std::string & trajectory_id,
-  const std::string & segment_name)
+  const std::string & segment_name,
+  bool allow_empty)
 {
   if (
     segment.x.size() != segment.y.size() ||
@@ -278,6 +283,9 @@ static std::vector<Vec3> segment_points(
   }
 
   if (segment.x.empty()) {
+    if (allow_empty) {
+      return {};
+    }
     throw std::runtime_error(
       "Trajectory '" + trajectory_id + "': segment '" + segment_name + "' is empty");
   }
@@ -312,7 +320,8 @@ static Phase connection_phase(const TaggedPoint & start, const TaggedPoint & end
 }
 
 static std::vector<GeometrySegment> build_geometry_segments(
-  const StaticTrajectory & trajectory)
+  const StaticTrajectory & trajectory,
+  bool allow_empty_phases)
 {
   if (trajectory.repetitions == 0U) {
     throw std::runtime_error(
@@ -320,11 +329,11 @@ static std::vector<GeometrySegment> build_geometry_segments(
   }
 
   const auto takeoff = segment_points(
-    trajectory.takeoff, trajectory.trajectory_id, "takeoff");
+    trajectory.takeoff, trajectory.trajectory_id, "takeoff", allow_empty_phases);
   const auto mission = segment_points(
-    trajectory.mission, trajectory.trajectory_id, "mission");
+    trajectory.mission, trajectory.trajectory_id, "mission", allow_empty_phases);
   const auto landing = segment_points(
-    trajectory.landing, trajectory.trajectory_id, "landing");
+    trajectory.landing, trajectory.trajectory_id, "landing", allow_empty_phases);
 
   std::vector<TaggedPoint> expanded;
   expanded.reserve(
@@ -337,6 +346,9 @@ static std::vector<GeometrySegment> build_geometry_segments(
   append_tagged_points(expanded, landing, Phase::LANDING);
 
   if (expanded.size() < 2U) {
+    if (allow_empty_phases) {
+      return {};
+    }
     throw std::runtime_error(
       "Trajectory '" + trajectory.trajectory_id + "': expanded geometry has fewer than 2 points");
   }
@@ -492,8 +504,11 @@ public:
       "available_static_trajectories_topic", "/available_static_trajectories");
     active_topic_ = declare_parameter<std::string>(
       "active_trajectories_topic", "/active_trajectories");
-    collision_topic_ = declare_parameter<std::string>(
-      "collision_static_trajectories_topic", "/collision_static_trajectories");
+    supervised_topic_ = declare_parameter<std::string>(
+      "supervised_trajectories_topic", "/supervised_trajectories");
+    non_priority_adjustment_topic_ = declare_parameter<std::string>(
+      "non_priority_adjustment_trajectories_topic",
+      "/non_priority_adjustment_trajectories");
     active_markers_topic_ = declare_parameter<std::string>(
       "active_trajectories_markers_topic", "/active_trajectories_markers");
 
@@ -537,15 +552,27 @@ public:
         this,
         std::placeholders::_1));
 
+    supervised_subscription_ = create_subscription<DetectedCollisionTrajectoryArray>(
+      supervised_topic_,
+      retained_qos,
+      std::bind(
+        &TrajectoryServerNode::supervised_callback,
+        this,
+        std::placeholders::_1));
+
     active_publisher_ = create_publisher<StaticTrajectoryArray>(
       active_topic_, retained_qos);
     active_markers_publisher_ = create_publisher<MarkerArray>(
       active_markers_topic_, retained_qos);
 
-    auto collision_qos = rclcpp::QoS(rclcpp::KeepLast(10));
-    collision_qos.reliable();
-    collision_publisher_ = create_publisher<CollisionStaticTrajectoryArray>(
-      collision_topic_, collision_qos);
+    // This is an event stream produced by runtime priority arbitration.
+    // It must NOT be published into /collision_static_trajectories, whose
+    // ownership belongs to static_trajectory_conflict_manager.
+    auto adjustment_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+    adjustment_qos.reliable();
+    non_priority_adjustment_publisher_ =
+      create_publisher<CollisionStaticTrajectoryArray>(
+        non_priority_adjustment_topic_, adjustment_qos);
 
     original_registration_client_ =
       create_client<RegisterOriginalTrajectory>(
@@ -557,13 +584,15 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "Trajectory server ready | input='%s' | active='%s' | collision='%s' | "
-      "registration_service='%s' | store=T-%.1fs | publish=T-%.1fs | "
+      "Trajectory server ready | input='%s' | supervised='%s' | active='%s' | "
+      "non_priority_adjustment='%s' | registration_service='%s' | "
+      "store=T-%.1fs | publish=T-%.1fs | "
       "reschedule margin=%.1fs | vehicle_status='%s' | spatial threshold=%.3fm | "
       "use_3d=%s | extra_time calculation=disabled",
       available_topic_.c_str(),
+      supervised_topic_.c_str(),
       active_topic_.c_str(),
-      collision_topic_.c_str(),
+      non_priority_adjustment_topic_.c_str(),
       original_trajectory_registration_service_.c_str(),
       storage_lead_time_s_,
       publication_lead_time_s_,
@@ -580,8 +609,9 @@ private:
         return !value.empty() && value.front() == '/';
       };
 
-    if (!absolute(available_topic_) || !absolute(active_topic_) ||
-      !absolute(collision_topic_) || !absolute(active_markers_topic_) ||
+    if (!absolute(available_topic_) || !absolute(supervised_topic_) ||
+      !absolute(active_topic_) || !absolute(non_priority_adjustment_topic_) ||
+      !absolute(active_markers_topic_) ||
       !absolute(original_trajectory_registration_service_))
     {
       throw std::runtime_error(
@@ -621,7 +651,7 @@ private:
     }
   }
 
-  static bool valid_trajectory(const StaticTrajectory & trajectory)
+  static bool valid_trajectory_identity_and_time(const StaticTrajectory & trajectory)
   {
     return !trajectory.trajectory_id.empty() &&
       !trajectory.flight_zone_id.empty() &&
@@ -629,30 +659,90 @@ private:
       time_to_ns(trajectory.operation_end_utc) > time_to_ns(trajectory.operation_start_utc);
   }
 
-  void available_callback(const StaticTrajectoryArray::SharedPtr message)
+  static bool segment_coordinates_valid(
+    const TrajectorySegment & segment,
+    bool allow_empty)
   {
-    if (!message) {
+    if (
+      segment.x.size() != segment.y.size() ||
+      segment.x.size() != segment.z.size())
+    {
+      return false;
+    }
+
+    if (!allow_empty && segment.x.empty()) {
+      return false;
+    }
+
+    for (std::size_t index = 0U; index < segment.x.size(); ++index) {
+      if (
+        !std::isfinite(segment.x[index]) ||
+        !std::isfinite(segment.y[index]) ||
+        !std::isfinite(segment.z[index]))
+      {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool is_supervised_id_locked(const std::string & trajectory_id) const
+  {
+    return latest_supervised_.find(trajectory_id) != latest_supervised_.end();
+  }
+
+  bool geometry_allowed_locked(const StaticTrajectory & trajectory) const
+  {
+    const bool supervised = is_supervised_id_locked(trajectory.trajectory_id);
+
+    if (trajectory.repetitions == 0U) {
+      return false;
+    }
+
+    // Normal trajectories keep the original strict requirement: every phase
+    // must contain geometry. A supervised trajectory is special because its
+    // AVAILABLE copy is the deliberately cropped version and TAKEOFF, MISSION
+    // or LANDING may therefore be empty.
+    return
+      segment_coordinates_valid(trajectory.takeoff, supervised) &&
+      segment_coordinates_valid(trajectory.mission, supervised) &&
+      segment_coordinates_valid(trajectory.landing, supervised);
+  }
+
+  void rebuild_available_locked()
+  {
+    if (!available_received_) {
       return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_header_ = message->header;
-
     std::map<std::string, StaticTrajectory> next;
-    for (const auto & trajectory : message->trajectories) {
-      if (!valid_trajectory(trajectory)) {
+
+    for (const auto & trajectory : raw_available_.trajectories) {
+      if (!valid_trajectory_identity_and_time(trajectory)) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 3000,
           "Ignoring malformed trajectory in /available_static_trajectories");
         continue;
       }
+
+      if (!geometry_allowed_locked(trajectory)) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "Ignoring trajectory '%s': incomplete/invalid geometry is only allowed "
+          "while the trajectory is present in /supervised_trajectories",
+          trajectory.trajectory_id.c_str());
+        continue;
+      }
+
       next[trajectory_source_key(trajectory)] = trajectory;
     }
+
     latest_available_ = std::move(next);
 
     // A completed/rejected occurrence may remain in the retained upstream
     // snapshot for a short time. Forget the guard only once that source
-    // occurrence truly disappears from the input snapshot.
+    // occurrence truly disappears from the accepted input set.
     for (auto it = completed_source_keys_.begin(); it != completed_source_keys_.end();) {
       if (latest_available_.find(*it) == latest_available_.end()) {
         it = completed_source_keys_.erase(it);
@@ -660,6 +750,7 @@ private:
         ++it;
       }
     }
+
     for (auto it = rejected_source_keys_.begin(); it != rejected_source_keys_.end();) {
       if (latest_available_.find(*it) == latest_available_.end()) {
         it = rejected_source_keys_.erase(it);
@@ -682,7 +773,8 @@ private:
       if (source == latest_available_.end()) {
         RCLCPP_INFO(
           get_logger(),
-          "Removing stored trajectory '%s': no longer present in /available_static_trajectories",
+          "Removing stored trajectory '%s': no longer accepted from "
+          "/available_static_trajectories",
           it->second.trajectory.trajectory_id.c_str());
         it = pending_.erase(it);
         continue;
@@ -693,6 +785,44 @@ private:
       it->second.original_end_ns = time_to_ns(source->second.operation_end_utc);
       ++it;
     }
+  }
+
+  void available_callback(const StaticTrajectoryArray::SharedPtr message)
+  {
+    if (!message) {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_header_ = message->header;
+    raw_available_ = *message;
+    available_received_ = true;
+    rebuild_available_locked();
+  }
+
+  void supervised_callback(const DetectedCollisionTrajectoryArray::SharedPtr message)
+  {
+    if (!message) {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::map<std::string, DetectedCollisionTrajectory> next;
+    for (const auto & detected : message->trajectories) {
+      const auto & id = detected.trajectory.trajectory_id;
+      if (id.empty()) {
+        continue;
+      }
+      next[id] = detected;
+    }
+
+    latest_supervised_ = std::move(next);
+
+    // The retained inputs may arrive in either order at node startup. Rebuild
+    // the AVAILABLE view whenever supervision state changes so an incomplete
+    // supervised trajectory is not lost merely because AVAILABLE arrived first.
+    rebuild_available_locked();
   }
 
   void ensure_vehicle_status_watcher_locked(const StaticTrajectory & trajectory)
@@ -756,8 +886,10 @@ private:
       return result;
     }
 
-    const auto candidate_segments = build_geometry_segments(candidate);
-    const auto active_segments = build_geometry_segments(active);
+    const auto candidate_segments = build_geometry_segments(
+      candidate, is_supervised_id_locked(candidate.trajectory_id));
+    const auto active_segments = build_geometry_segments(
+      active, is_supervised_id_locked(active.trajectory_id));
 
     for (const auto & candidate_segment : candidate_segments) {
       for (const auto & active_segment : active_segments) {
@@ -886,18 +1018,18 @@ private:
     const std::string & source_key,
     const PendingTrajectory & pending,
     std::vector<TrajectoryCollision> collisions,
-    std::vector<CollisionStaticTrajectory> & collision_events)
+    std::vector<CollisionStaticTrajectory> & adjustment_events)
   {
     CollisionStaticTrajectory event;
     event.trajectory = pending.trajectory;
     event.collisions = std::move(collisions);
-    collision_events.push_back(std::move(event));
+    adjustment_events.push_back(std::move(event));
     rejected_source_keys_.insert(source_key);
 
     RCLCPP_WARN(
       get_logger(),
-      "Trajectory '%s' rejected at activation: an active spatially conflicting "
-      "trajectory has strictly higher priority",
+      "Trajectory '%s' sent to /non_priority_adjustment_trajectories: "
+      "an active spatially conflicting trajectory has strictly higher priority",
       pending.trajectory.trajectory_id.c_str());
   }
 
@@ -1046,7 +1178,7 @@ private:
 
   void process_pending_locked(
     int64_t current_ns,
-    std::vector<CollisionStaticTrajectory> & collision_events)
+    std::vector<CollisionStaticTrajectory> & adjustment_events)
   {
     const int64_t publication_lead_ns = static_cast<int64_t>(std::llround(
       publication_lead_time_s_ * static_cast<double>(kNanosecondsPerSecond)));
@@ -1143,7 +1275,7 @@ private:
           source_key,
           pending,
           std::move(rejecting_collisions),
-          collision_events);
+          adjustment_events);
         pending_.erase(pending_it);
         continue;
       }
@@ -1313,7 +1445,7 @@ private:
     const int64_t current_ns = system_now_ns();
     StaticTrajectoryArray active_output;
     MarkerArray active_markers;
-    std::vector<CollisionStaticTrajectory> collision_events;
+    std::vector<CollisionStaticTrajectory> adjustment_events;
 
     std::size_t stored_count = 0U;
     std::size_t waiting_count = 0U;
@@ -1322,7 +1454,7 @@ private:
       std::lock_guard<std::mutex> lock(mutex_);
       mark_active_completions_locked(current_ns);
       store_due_candidates_locked(current_ns);
-      process_pending_locked(current_ns, collision_events);
+      process_pending_locked(current_ns, adjustment_events);
       prune_vehicle_watchers_locked();
       publish_active_snapshot_locked(active_output, active_markers);
 
@@ -1337,12 +1469,12 @@ private:
     active_publisher_->publish(active_output);
     active_markers_publisher_->publish(active_markers);
 
-    if (!collision_events.empty()) {
-      CollisionStaticTrajectoryArray collision_output;
-      collision_output.header = active_output.header;
-      collision_output.header.stamp = now();
-      collision_output.trajectories = std::move(collision_events);
-      collision_publisher_->publish(collision_output);
+    if (!adjustment_events.empty()) {
+      CollisionStaticTrajectoryArray adjustment_output;
+      adjustment_output.header = active_output.header;
+      adjustment_output.header.stamp = now();
+      adjustment_output.trajectories = std::move(adjustment_events);
+      non_priority_adjustment_publisher_->publish(adjustment_output);
     }
 
     if (last_active_count_ != active_output.trajectories.size()) {
@@ -1357,8 +1489,9 @@ private:
   }
 
   std::string available_topic_;
+  std::string supervised_topic_;
   std::string active_topic_;
-  std::string collision_topic_;
+  std::string non_priority_adjustment_topic_;
   std::string active_markers_topic_;
   std::string original_trajectory_registration_service_;
 
@@ -1380,6 +1513,9 @@ private:
 
   mutable std::mutex mutex_;
   std_msgs::msg::Header latest_header_;
+  StaticTrajectoryArray raw_available_;
+  bool available_received_{false};
+  std::map<std::string, DetectedCollisionTrajectory> latest_supervised_;
   std::map<std::string, StaticTrajectory> latest_available_;
   std::map<std::string, PendingTrajectory> pending_;
   std::map<std::string, ActiveTrajectory> active_;
@@ -1389,8 +1525,10 @@ private:
   std::size_t last_active_count_{std::numeric_limits<std::size_t>::max()};
 
   rclcpp::Subscription<StaticTrajectoryArray>::SharedPtr available_subscription_;
+  rclcpp::Subscription<DetectedCollisionTrajectoryArray>::SharedPtr supervised_subscription_;
   rclcpp::Publisher<StaticTrajectoryArray>::SharedPtr active_publisher_;
-  rclcpp::Publisher<CollisionStaticTrajectoryArray>::SharedPtr collision_publisher_;
+  rclcpp::Publisher<CollisionStaticTrajectoryArray>::SharedPtr
+    non_priority_adjustment_publisher_;
   rclcpp::Publisher<MarkerArray>::SharedPtr active_markers_publisher_;
   rclcpp::Client<RegisterOriginalTrajectory>::SharedPtr original_registration_client_;
   rclcpp::TimerBase::SharedPtr supervision_timer_;

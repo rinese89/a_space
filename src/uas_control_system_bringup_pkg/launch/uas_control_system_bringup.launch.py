@@ -205,7 +205,8 @@ def _launch_setup(context, *_args, **_kwargs):
                 f"flight_zone='{flight_zone_id}' | "
                 f"ROS namespace='/{ros_namespace}' | "
                 f"PX4 DDS namespace='/{px4_dds_namespace}' | "
-                "micro_ros_agent=EXTERNAL | ros_gz_bridge=EXTERNAL"
+                "micro_ros_agent=EXTERNAL | ros_gz_bridge=EXTERNAL | "
+                "control_manager_input=SupervisionControl action"
             )
         ),
         IncludeLaunchDescription(
@@ -228,6 +229,12 @@ def _launch_setup(context, *_args, **_kwargs):
                 "flight_zone_id": flight_zone_id,
             }.items(),
         ),
+        # control_manager_node no longer subscribes to /active_trajectories.
+        # It exposes:
+        #   /<flight_zone>/<uas_namespace>/supervision_control
+        # using flight_zone_supervision/action/SupervisionControl.
+        # The flight-zone supervision node is responsible for forwarding
+        # EXECUTE / PAUSE / RESUME / STOP commands to this action server.
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(control_manager_launch),
             launch_arguments={

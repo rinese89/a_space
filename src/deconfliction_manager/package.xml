@@ -1,29 +1,34 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>deconfliction_manager</name>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
 
   <description>
-    Classifies detected static-trajectory collisions into requested supervision
-    or manual adjustment while preserving complete DetectedCollisionTrajectory
-    collision evidence and publishing RViz markers for both states.
+    Classifies detected collision trajectories using unique virtual-net node
+    count and publishes supervision requests containing the original collision
+    detection payload plus a geometry-only virtual-net crop.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
 
   <depend>rclcpp</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>visualization_msgs</depend>
-  <depend>static_trajectory_manager</depend>
   <depend>collision_detection</depend>
+  <depend>static_trajectory_manager</depend>
+  <depend>a_space_virtual_net</depend>
 
+  <exec_depend>rosidl_default_runtime</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -1,19 +1,30 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>supervision_trajectory_manager</name>
-  <version>0.2.0</version>
-  <description>Stores supervision requests, crops conflicting trajectory geometry, republishes adjusted trajectories, verifies acceptance and republishes the original detected-collision trajectory while its adjusted geometry remains available.</description>
+  <version>0.4.1</version>
+
+  <description>
+    Acquires upstream virtual-net supervision crops from deconfliction_manager,
+    injects their legacy StaticTrajectory representation, confirms the crop in
+    AVAILABLE, publishes the original collision payload as supervised state,
+    and synchronizes periodic occurrence times.
+  </description>
+
   <maintainer email="maintainer@example.com">A-space</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>builtin_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>visualization_msgs</depend>
-  <depend>static_trajectory_manager</depend>
+
+  <depend>a_space_virtual_net</depend>
   <depend>collision_detection</depend>
+  <depend>deconfliction_manager</depend>
+  <depend>static_trajectory_manager</depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

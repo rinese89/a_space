@@ -22,17 +22,17 @@ static_trajectory_manager:
 
       # Partial repetition: only the mission segment is repeated.
       # repetitions: 1 => mission flown once.
-      repetitions: 1
+      repetitions: 5
 
       # Total repetition period in seconds.
       # 0.0 disables complete takeoff-mission-landing repetition.
-      operation_frequency: 120.0
+      operation_frequency: 300.0
 
       # Used to estimate operation_end_utc from total geometric distance.
       average_speed_mps: 2.0
 
       # Only temporal datum supplied by the operator.
-      operation_start_utc: "2026-09-03T09:00:00Z"
+      operation_start_utc: "2026-09-05T19:03:00Z"
 
       takeoff:
         x: [3.0, 3.0]
@@ -40,8 +40,8 @@ static_trajectory_manager:
         z: [0.0, 3.0]
 
       mission:
-        x: [3.0, 6.0, 6.0, 3.0, 3.0]
-        y: [3.0, 3.0, 6.0, 6.0, 3.0]
+        x: [3.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 9.0, 11.0, 11.0, 3.0, 3.0]
+        y: [3.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 8.0, 8.0, 2.0, 2.0, 3.0]
         height: 3.0
 
       landing:
@@ -62,17 +62,17 @@ static_trajectory_manager:
 
       # Partial repetition: only the mission segment is repeated.
       # repetitions: 1 => mission flown once.
-      repetitions: 1
+      repetitions: 5
 
       # Total repetition period in seconds.
       # 0.0 disables complete takeoff-mission-landing repetition.
-      operation_frequency: 120.0
+      operation_frequency: 300.0
 
       # Used to estimate operation_end_utc from total geometric distance.
       average_speed_mps: 2.0
 
       # Only temporal datum supplied by the operator.
-      operation_start_utc: "2026-09-03T09:00:00Z"
+      operation_start_utc: "2026-09-05T19:03:00Z"
 
       takeoff:
         x: [6.0, 6.0]
@@ -80,8 +80,8 @@ static_trajectory_manager:
         z: [0.0, 3.0]
 
       mission:
-        x: [6.0, 6.0, 8.0, 8.0, 6.0]
-        y: [3.0, 4.0, 4.0, 3.0, 3.0]
+        x: [6.0, 6.0, 6.0, 6.0, 7.0, 8.0, 9.0, 9.0, 11.0, 11.0, 6.0, 6.0, 6.0, 6.0, 6.0]
+        y: [3.0, 4.0, 5.0, 6.0, 6.0, 6.0, 6.0, 8.0, 8.0, 10.0, 10.0, 7.0, 6.0, 5.0, 3.0]
         height: 3.0
 
       landing:

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(updated_flow_server)
+project(flight_zone_supervision)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -7,33 +7,40 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(flight_zone_msgs REQUIRED)
 find_package(static_trajectory_manager REQUIRED)
-find_package(static_trajectory_conflict_manager REQUIRED)
+find_package(collision_detection REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/FlowTrajectoryStatus.msg"
-  "msg/UpdatedFlowStatus.msg"
-  DEPENDENCIES std_msgs
+  "action/SupervisionControl.action"
+  DEPENDENCIES
+    static_trajectory_manager
 )
 
-add_executable(updated_flow_server_node src/updated_flow_server_node.cpp)
-
-ament_target_dependencies(updated_flow_server_node
+add_executable(supervision_node src/supervision_node.cpp)
+ament_target_dependencies(supervision_node
   rclcpp
+  rclcpp_action
+  geometry_msgs
   std_msgs
+  visualization_msgs
+  flight_zone_msgs
   static_trajectory_manager
-  static_trajectory_conflict_manager
+  collision_detection
 )
 
-target_compile_features(updated_flow_server_node PUBLIC cxx_std_17)
+target_compile_features(supervision_node PUBLIC cxx_std_17)
 
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(updated_flow_server_node "${cpp_typesupport_target}")
+target_link_libraries(supervision_node "${cpp_typesupport_target}")
 
-install(TARGETS updated_flow_server_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS supervision_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
 install(FILES README.md DESTINATION share/${PROJECT_NAME})
 

@@ -1,0 +1,40 @@
+/**:
+  ros__parameters:
+    available_static_trajectories_topic: /available_static_trajectories
+    supervised_trajectories_topic: /supervised_trajectories
+    active_trajectories_topic: /active_trajectories
+
+    zone_status_suffix: zone_status
+    control_action_suffix: supervision_control
+
+    # Phase 1:
+    # Normal PAUSE/RESUME supervision is applied to the UAS executing the
+    # supervised trajectory.
+    security_distance_m: 3.0
+    use_3d_distance: true
+    zone_status_timeout_s: 2.0
+
+    # Escalation criterion:
+    # While the supervised UAS is paused inside the security distance, the
+    # separation must increase by at least this amount within this window.
+    # Otherwise the non-supervised counterpart is paused and the supervised UAS
+    # is resumed so it can clear the original collision section.
+    distance_progress_timeout_s: 0.5
+    distance_progress_epsilon_m: 0.05
+
+    # Phase 2:
+    # The counterpart remains PAUSED until the supervised UAS position is more
+    # than (distance + hysteresis) away from every collision node/segment stored
+    # in /supervised_trajectories.
+    collision_exit_distance_m: 1.0
+    collision_exit_hysteresis_m: 0.20
+
+    evaluation_period_ms: 100
+    action_wait_timeout_ms: 20
+
+    markers_topic: supervision_markers
+    trajectory_line_width: 0.10
+    collision_segment_width: 0.20
+    collision_node_scale: 0.34
+    drone_scale: 0.42
+    text_height: 0.30

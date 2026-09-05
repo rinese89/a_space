@@ -1,0 +1,942 @@
+--- control_manager_node_old.cpp
++++ src/control_manager_node.cpp
+@@ -7,6 +7,7 @@
+ #include <static_trajectory_manager/msg/static_trajectory_array.hpp>
+ #include <static_trajectory_manager/msg/trajectory_segment.hpp>
+ #include <control_manager_pkg/srv/control_trajectory.hpp>
++#include <flight_zone_supervision/action/supervision_control.hpp>
+ 
+ #include <geometry_msgs/msg/point_stamped.hpp>
+ #include <tf2/exceptions.h>
+@@ -44,6 +45,9 @@
+ using GoalHandleFollowWaypoints = rclcpp_action::ClientGoalHandle<FollowWaypoints>;
+ using FollowWaypointsClient = rclcpp_action::Client<FollowWaypoints>;
+ using ControlTrajectory = control_manager_pkg::srv::ControlTrajectory;
++using SupervisionControl = flight_zone_supervision::action::SupervisionControl;
++using GoalHandleSupervisionControl = rclcpp_action::ServerGoalHandle<SupervisionControl>;
++using SupervisionControlServer = rclcpp_action::Server<SupervisionControl>;
+ 
+ constexpr int64_t kNsPerSecond = 1000000000LL;
+ constexpr double kEpsilon = 1.0e-9;
+@@ -59,6 +63,7 @@
+ {
+   WAITING_TRAJECTORY,
+   WAITING_START,
++  PAUSED_BEFORE_START,
+   TAKEOFF_REQUEST,
+   TAKEOFF_RESPONSE,
+   MISSION_DISPATCH,
+@@ -152,13 +157,13 @@
+   {
+     derive_identity_from_namespace();
+ 
+-    active_trajectories_topic_ = declare_parameter<std::string>(
+-      "active_trajectories_topic", "/active_trajectories");
+     odom_frame_suffix_ = declare_parameter<std::string>("odom_frame_suffix", "odom");
+     arm_takeoff_service_suffix_ = declare_parameter<std::string>(
+       "arm_takeoff_service_suffix", "arm_takeoff");
+     follow_waypoints_action_suffix_ = declare_parameter<std::string>(
+       "follow_waypoints_action_suffix", "follow_waypoints");
++    supervision_action_suffix_ = declare_parameter<std::string>(
++      "supervision_action_suffix", "supervision_control");
+     operator_service_suffix_ = declare_parameter<std::string>(
+       "operator_service_suffix", "trajectory_control");
+ 
+@@ -179,19 +184,29 @@
+     validate_parameters();
+ 
+     expected_action_name_ = "/" + drone_namespace_ + "/" + follow_waypoints_action_suffix_;
++    supervision_action_name_ = "/" + drone_namespace_ + "/" + supervision_action_suffix_;
+     odom_frame_ = drone_namespace_ + "/" + odom_frame_suffix_;
+-
+-    auto snapshot_qos = rclcpp::QoS(rclcpp::KeepLast(1));
+-    snapshot_qos.reliable();
+-    snapshot_qos.transient_local();
+-
+-    active_subscription_ = create_subscription<StaticTrajectoryArray>(
+-      active_trajectories_topic_, snapshot_qos,
+-      std::bind(&ControlManagerNode::active_trajectories_callback, this, std::placeholders::_1));
+ 
+     arm_takeoff_client_ = create_client<ArmTakeoff>(arm_takeoff_service_suffix_);
+     follow_waypoints_client_ = rclcpp_action::create_client<FollowWaypoints>(
+       this, follow_waypoints_action_suffix_);
++
++    supervision_action_server_ = rclcpp_action::create_server<SupervisionControl>(
++      this,
++      supervision_action_suffix_,
++      std::bind(
++        &ControlManagerNode::handle_supervision_goal,
++        this,
++        std::placeholders::_1,
++        std::placeholders::_2),
++      std::bind(
++        &ControlManagerNode::handle_supervision_cancel,
++        this,
++        std::placeholders::_1),
++      std::bind(
++        &ControlManagerNode::handle_supervision_accepted,
++        this,
++        std::placeholders::_1));
+ 
+     operator_service_ = create_service<ControlTrajectory>(
+       operator_service_suffix_,
+@@ -210,11 +225,15 @@
+ 
+     RCLCPP_INFO(
+       get_logger(),
+-      "Control manager ready | UAS='/%s' | active='%s' | controller service='/%s/%s' | "
+-      "action='%s' | operator service='/%s/%s'",
+-      drone_namespace_.c_str(), active_trajectories_topic_.c_str(),
+-      drone_namespace_.c_str(), arm_takeoff_service_suffix_.c_str(),
+-      expected_action_name_.c_str(), drone_namespace_.c_str(), operator_service_suffix_.c_str());
++      "Control manager ready | UAS='/%s' | supervision action='%s' | "
++      "controller service='/%s/%s' | follow action='%s' | operator service='/%s/%s'",
++      drone_namespace_.c_str(),
++      supervision_action_name_.c_str(),
++      drone_namespace_.c_str(),
++      arm_takeoff_service_suffix_.c_str(),
++      expected_action_name_.c_str(),
++      drone_namespace_.c_str(),
++      operator_service_suffix_.c_str());
+   }
+ 
+ private:
+@@ -236,20 +255,21 @@
+ 
+   void validate_parameters() const
+   {
+-    if (active_trajectories_topic_.empty() || active_trajectories_topic_.front() != '/') {
+-      throw std::runtime_error("active_trajectories_topic must be absolute");
+-    }
+     const auto valid_relative = [](const std::string & value) {
+         return !value.empty() && value.front() != '/' && value.back() != '/' &&
+                value.find("//") == std::string::npos;
+       };
++
+     if (!valid_relative(odom_frame_suffix_) ||
+       !valid_relative(arm_takeoff_service_suffix_) ||
+       !valid_relative(follow_waypoints_action_suffix_) ||
++      !valid_relative(supervision_action_suffix_) ||
+       !valid_relative(operator_service_suffix_))
+     {
+-      throw std::runtime_error("controller/topic/service suffixes must be valid relative ROS names");
+-    }
++      throw std::runtime_error(
++              "controller/action/service suffixes must be valid relative ROS names");
++    }
++
+     if (tick_period_ms_ <= 0 || retry_period_ms_ <= 0 || service_wait_timeout_ms_ < 0 ||
+       action_wait_timeout_ms_ < 0 || max_start_lateness_s_ < 0.0 || transform_timeout_s_ < 0.0 ||
+       !finite(service_yaw_rad_) ||
+@@ -349,66 +369,419 @@
+     }
+   }
+ 
+-  void active_trajectories_callback(const StaticTrajectoryArray::SharedPtr message)
+-  {
+-    if (!message) {
+-      return;
+-    }
+-
+-    std::optional<StaticTrajectory> best;
+-    for (const auto & trajectory : message->trajectories) {
+-      if (!trajectory_matches(trajectory)) {
+-        continue;
++  rclcpp_action::GoalResponse handle_supervision_goal(
++    const rclcpp_action::GoalUUID &,
++    std::shared_ptr<const SupervisionControl::Goal> goal)
++  {
++    if (!goal) {
++      return rclcpp_action::GoalResponse::REJECT;
++    }
++
++    switch (goal->command) {
++      case SupervisionControl::Goal::EXECUTE:
++      case SupervisionControl::Goal::PAUSE:
++      case SupervisionControl::Goal::RESUME:
++      case SupervisionControl::Goal::STOP:
++        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
++
++      default:
++        RCLCPP_WARN(
++          get_logger(),
++          "[/%s] Rejecting unknown supervision action command=%u",
++          drone_namespace_.c_str(),
++          static_cast<unsigned>(goal->command));
++        return rclcpp_action::GoalResponse::REJECT;
++    }
++  }
++
++  rclcpp_action::CancelResponse handle_supervision_cancel(
++    const std::shared_ptr<GoalHandleSupervisionControl>)
++  {
++    // SupervisionControl goals are short command transactions. Flight
++    // cancellation is requested explicitly through PAUSE or STOP.
++    return rclcpp_action::CancelResponse::REJECT;
++  }
++
++  void handle_supervision_accepted(
++    const std::shared_ptr<GoalHandleSupervisionControl> goal_handle)
++  {
++    if (!goal_handle) {
++      return;
++    }
++
++    const auto goal = goal_handle->get_goal();
++    auto result = std::make_shared<SupervisionControl::Result>();
++    auto feedback = std::make_shared<SupervisionControl::Feedback>();
++
++    if (!goal) {
++      result->accepted = false;
++      result->message = "null supervision goal";
++      result->state = state_name(state_);
++      goal_handle->succeed(result);
++      return;
++    }
++
++    std::string message;
++    bool accepted = false;
++
++    switch (goal->command) {
++      case SupervisionControl::Goal::EXECUTE:
++        accepted = accept_execute_command(goal->trajectories, message);
++        break;
++
++      case SupervisionControl::Goal::PAUSE:
++        accepted = request_supervision_pause(message);
++        break;
++
++      case SupervisionControl::Goal::RESUME:
++        accepted = request_supervision_resume(message);
++        break;
++
++      case SupervisionControl::Goal::STOP:
++        accepted = request_supervision_stop(message);
++        break;
++
++      default:
++        message = "unknown command";
++        break;
++    }
++
++    feedback->state = state_name(state_);
++    goal_handle->publish_feedback(feedback);
++
++    result->accepted = accepted;
++    result->message = message;
++    result->state = state_name(state_);
++
++    if (accepted) {
++      RCLCPP_INFO(
++        get_logger(),
++        "[/%s] Supervision command=%u accepted | state=%s | reason='%s'",
++        drone_namespace_.c_str(),
++        static_cast<unsigned>(goal->command),
++        state_name(state_),
++        goal->reason.c_str());
++    } else {
++      RCLCPP_WARN(
++        get_logger(),
++        "[/%s] Supervision command=%u rejected | state=%s | %s",
++        drone_namespace_.c_str(),
++        static_cast<unsigned>(goal->command),
++        state_name(state_),
++        message.c_str());
++    }
++
++    // The action acknowledges command acquisition. Mission execution continues
++    // asynchronously in this node's state machine.
++    goal_handle->succeed(result);
++  }
++
++  bool accept_execute_command(
++    const StaticTrajectoryArray & trajectories,
++    std::string & message)
++  {
++    if (trajectories.trajectories.size() != 1U) {
++      message =
++        "EXECUTE requires exactly one StaticTrajectory in trajectories[]";
++      return false;
++    }
++
++    const auto & trajectory =
++      trajectories.trajectories.front();
++
++    std::string reason;
++    if (!validate_trajectory(trajectory, reason)) {
++      message =
++        "invalid EXECUTE trajectory: " +
++        reason;
++      return false;
++    }
++
++    const std::string key =
++      occurrence_key(trajectory);
++
++    if (already_completed(key)) {
++      message =
++        "trajectory occurrence was already completed; command treated as idempotent";
++      return true;
++    }
++
++    if (
++      state_ == State::COMPLETED ||
++      state_ == State::FAILED)
++    {
++      clear_plan();
++    }
++
++    if (active_trajectory_) {
++      if (active_occurrence_key_ == key) {
++        // While the occurrence has not started, allow an idempotent EXECUTE to
++        // refresh the exact trajectory definition.
++        if (
++          state_ == State::WAITING_START ||
++          state_ == State::PAUSED_BEFORE_START)
++        {
++          active_trajectory_ =
++            trajectory;
++          build_expanded_mission();
++        }
++
++        message =
++          "trajectory occurrence is already stored/executing";
++        return true;
+       }
+-      std::string reason;
+-      if (!validate_trajectory(trajectory, reason)) {
+-        RCLCPP_WARN_THROTTLE(
+-          get_logger(), *get_clock(), 3000,
+-          "[/%s] Ignoring invalid active trajectory '%s': %s",
+-          drone_namespace_.c_str(), trajectory.trajectory_id.c_str(), reason.c_str());
+-        continue;
++
++      message =
++        "control manager is busy with occurrence '" +
++        active_occurrence_key_ +
++        "'";
++      return false;
++    }
++
++    if (state_ != State::WAITING_TRAJECTORY) {
++      message =
++        std::string(
++        "cannot acquire a new trajectory while state=") +
++        state_name(state_);
++      return false;
++    }
++
++    active_trajectory_ =
++      trajectory;
++
++    active_occurrence_key_ =
++      key;
++
++    build_expanded_mission();
++
++    state_ =
++      State::WAITING_START;
++
++    if (preemptive_pause_latch_) {
++      preemptive_pause_latch_ = false;
++      supervision_start_delay_authorized_ = true;
++      state_ =
++        State::PAUSED_BEFORE_START;
++    }
++
++    next_attempt_at_ =
++      std::chrono::steady_clock::now();
++
++    const std::string conflict_detail =
++      active_trajectory_->spacial_conflict ?
++      " | conflict_with='" +
++      active_trajectory_->
++      spacial_conflicting_trajectory_id +
++      "'" :
++      "";
++
++    RCLCPP_INFO(
++      get_logger(),
++      "[/%s] Acquired trajectory by supervision action '%s' | P%d | "
++      "start_ns=%ld | mission_points=%zu | spacial_conflict=%s%s",
++      drone_namespace_.c_str(),
++      active_trajectory_->trajectory_id.c_str(),
++      active_trajectory_->priority,
++      static_cast<long>(
++        time_to_ns(
++          active_trajectory_->
++          operation_start_utc)),
++      mission_path_map_.size(),
++      active_trajectory_->spacial_conflict ?
++      "true" :
++      "false",
++      conflict_detail.c_str());
++
++    message =
++      "trajectory occurrence acquired";
++    return true;
++  }
++
++  bool request_supervision_pause(
++    std::string & message)
++  {
++    if (!active_trajectory_) {
++      preemptive_pause_latch_ = true;
++      message =
++        "pause latched; the next EXECUTE occurrence will be acquired in PAUSED_BEFORE_START";
++      return true;
++    }
++
++    switch (state_) {
++      case State::WAITING_START:
++      case State::TAKEOFF_REQUEST:
++        pending_pause_request_ = false;
++        supervision_start_delay_authorized_ = true;
++        state_ =
++          State::PAUSED_BEFORE_START;
++        message =
++          "paused before takeoff/start";
++        return true;
++
++      case State::TAKEOFF_RESPONSE:
++        pending_pause_request_ = true;
++        message =
++          "pause queued; takeoff command is already in flight and mission will remain HOLD afterward";
++        return true;
++
++      case State::MISSION_DISPATCH:
++        pending_pause_request_ = false;
++        state_ =
++          State::PAUSED;
++        message =
++          "paused before mission action dispatch; controller remains in HOLD";
++        return true;
++
++      case State::MISSION_ACTIVE:
++        if (!active_goal_handle_) {
++          message =
++            "mission state is active but no FollowWaypoints goal handle is available";
++          return false;
++        }
++
++        pending_pause_request_ = true;
++        message =
++          "pause requested; mission goal will be canceled and controller will HOLD";
++        return true;
++
++      case State::PAUSE_CANCELING:
++      case State::PAUSED:
++      case State::PAUSED_BEFORE_START:
++        message =
++          "trajectory is already paused or pause is in progress";
++        return true;
++
++      default:
++        message =
++          std::string(
++          "PAUSE is not valid while state=") +
++          state_name(state_);
++        return false;
++    }
++  }
++
++  bool request_supervision_resume(
++    std::string & message)
++  {
++    if (!active_trajectory_) {
++      if (preemptive_pause_latch_) {
++        preemptive_pause_latch_ = false;
++        message =
++          "preemptive pause latch cleared before trajectory acquisition";
++      } else {
++        message =
++          "no stored trajectory; nothing is paused";
+       }
+-      const std::string key = occurrence_key(trajectory);
+-      if (already_completed(key)) {
+-        continue;
+-      }
+-      if (!best || time_to_ns(trajectory.operation_start_utc) < time_to_ns(best->operation_start_utc) ||
+-        (time_to_ns(trajectory.operation_start_utc) == time_to_ns(best->operation_start_utc) &&
+-        trajectory.priority < best->priority))
+-      {
+-        best = trajectory;
+-      }
+-    }
+-
+-    if (state_ == State::WAITING_TRAJECTORY || state_ == State::WAITING_START) {
+-      if (!best) {
+-        if (state_ == State::WAITING_START) {
+-          RCLCPP_WARN(
+-            get_logger(), "[/%s] Stored trajectory was removed from /active_trajectories before start",
+-            drone_namespace_.c_str());
+-        }
+-        clear_plan();
+-        return;
+-      }
+-
+-      const std::string new_key = occurrence_key(*best);
+-      if (!active_trajectory_ || new_key != active_occurrence_key_) {
+-        active_trajectory_ = *best;
+-        active_occurrence_key_ = new_key;
+-        build_expanded_mission();
+-        state_ = State::WAITING_START;
+-        const std::string conflict_detail = active_trajectory_->spacial_conflict ?
+-          " | conflict_with='" + active_trajectory_->spacial_conflicting_trajectory_id + "'" : "";
+-        RCLCPP_INFO(
+-          get_logger(),
+-          "[/%s] Stored active trajectory '%s' | P%d | start_ns=%ld | mission_points=%zu | spacial_conflict=%s%s",
+-          drone_namespace_.c_str(), active_trajectory_->trajectory_id.c_str(),
+-          active_trajectory_->priority,
+-          static_cast<long>(time_to_ns(active_trajectory_->operation_start_utc)),
+-          mission_path_map_.size(), active_trajectory_->spacial_conflict ? "true" : "false",
+-          conflict_detail.c_str());
+-      }
+-    }
++      return true;
++    }
++
++    switch (state_) {
++      case State::PAUSED_BEFORE_START:
++        pending_pause_request_ = false;
++        resume_after_pause_ = false;
++        state_ =
++          State::WAITING_START;
++        next_attempt_at_ =
++          std::chrono::steady_clock::now();
++        message =
++          "resume accepted; scheduled operation may continue toward takeoff";
++        return true;
++
++      case State::PAUSED:
++        pending_pause_request_ = false;
++        resume_after_pause_ = false;
++        state_ =
++          State::MISSION_DISPATCH;
++        next_attempt_at_ =
++          std::chrono::steady_clock::now();
++        message =
++          "resume accepted; remaining mission will be sent from the paused waypoint";
++        return true;
++
++      case State::PAUSE_CANCELING:
++        resume_after_pause_ = true;
++        pending_pause_request_ = false;
++        message =
++          "resume queued; mission will continue as soon as pause cancellation completes";
++        return true;
++
++      case State::TAKEOFF_RESPONSE:
++        if (pending_pause_request_) {
++          pending_pause_request_ = false;
++          message =
++            "queued post-takeoff pause canceled; mission will continue";
++        } else {
++          message =
++            "trajectory is already running toward mission dispatch";
++        }
++        return true;
++
++      case State::MISSION_ACTIVE:
++        if (
++          pending_pause_request_ &&
++          !cancel_request_in_flight_)
++        {
++          pending_pause_request_ = false;
++          message =
++            "pending pause canceled; mission remains active";
++        } else if (cancel_request_in_flight_) {
++          resume_after_pause_ = true;
++          message =
++            "resume queued while mission cancellation is in flight";
++        } else {
++          message =
++            "mission is already active";
++        }
++        return true;
++
++      case State::WAITING_START:
++      case State::TAKEOFF_REQUEST:
++      case State::MISSION_DISPATCH:
++        pending_pause_request_ = false;
++        message =
++          "trajectory is already running/not paused";
++        return true;
++
++      default:
++        message =
++          std::string(
++          "RESUME is not valid while state=") +
++          state_name(state_);
++        return false;
++    }
++  }
++
++  bool request_supervision_stop(
++    std::string & message)
++  {
++    if (
++      state_ == State::RETURN_DISPATCH ||
++      state_ == State::RETURN_ACTIVE ||
++      state_ == State::LANDING_REQUEST ||
++      state_ == State::LANDING_RESPONSE ||
++      state_ == State::STOP_CANCELING)
++    {
++      message =
++        "total stop sequence is already in progress";
++      return true;
++    }
++
++    if (
++      state_ == State::WAITING_TRAJECTORY ||
++      state_ == State::COMPLETED ||
++      state_ == State::FAILED ||
++      !active_trajectory_)
++    {
++      message =
++        "there is no running/stored operation to stop";
++      return false;
++    }
++
++    resume_after_pause_ = false;
++    pending_stop_request_ = true;
++    message =
++      "total stop requested";
++    return true;
+   }
+ 
+   void build_expanded_mission()
+@@ -440,59 +813,45 @@
+       return;
+     }
+ 
++    std::string message;
++    bool accepted = false;
++
+     switch (request->command) {
+       case ControlTrajectory::Request::PAUSE:
+-        if (state_ != State::MISSION_ACTIVE || !active_goal_handle_ || action_purpose_ != ActionPurpose::MISSION) {
+-          response->message = "PAUSE is only valid while the mission action is active";
+-          return;
+-        }
+-        pending_pause_request_ = true;
+-        response->accepted = true;
+-        response->message = "pause requested; mission goal will be canceled and controller will HOLD";
++        accepted =
++          request_supervision_pause(
++          message);
+         break;
+ 
+       case ControlTrajectory::Request::RESUME:
+-        if (state_ != State::PAUSED) {
+-          response->message = "RESUME is only valid while PAUSED";
+-          return;
+-        }
+-        if (!active_trajectory_) {
+-          response->message = "no stored trajectory to resume";
+-          return;
+-        }
+-        state_ = State::MISSION_DISPATCH;
+-        next_attempt_at_ = std::chrono::steady_clock::now();
+-        response->accepted = true;
+-        response->message = "resume accepted; remaining mission will be sent from the paused waypoint";
++        accepted =
++          request_supervision_resume(
++          message);
+         break;
+ 
+       case ControlTrajectory::Request::STOP:
+-        if (state_ == State::RETURN_DISPATCH || state_ == State::RETURN_ACTIVE ||
+-          state_ == State::LANDING_REQUEST || state_ == State::LANDING_RESPONSE)
+-        {
+-          response->accepted = true;
+-          response->message = "total stop sequence is already in progress";
+-          response->state = state_name(state_);
+-          return;
+-        }
+-        if (state_ == State::WAITING_TRAJECTORY || state_ == State::COMPLETED || state_ == State::FAILED) {
+-          response->message = "there is no running/stored operation to stop";
+-          return;
+-        }
+-        pending_stop_request_ = true;
+-        response->accepted = true;
+-        response->message = "total stop requested; mission will be canceled, return-to-landing executed, then landing service sent";
++        accepted =
++          request_supervision_stop(
++          message);
+         break;
+ 
+       default:
+-        response->message = "unknown command";
+-        return;
+-    }
+-
++        message = "unknown command";
++        break;
++    }
++
++    response->accepted = accepted;
++    response->message = message;
+     response->state = state_name(state_);
+-    RCLCPP_WARN(
+-      get_logger(), "[/%s] Operator command=%u accepted in state=%s",
+-      drone_namespace_.c_str(), request->command, state_name(state_));
++
++    if (accepted) {
++      RCLCPP_WARN(
++        get_logger(),
++        "[/%s] Operator command=%u accepted in state=%s",
++        drone_namespace_.c_str(),
++        request->command,
++        state_name(state_));
++    }
+   }
+ 
+   bool transform_point_to_odom(const Point3 & source, const std::string & source_frame, Point3 & target)
+@@ -646,6 +1005,11 @@
+           state_ = action_purpose_ == ActionPurpose::RETURN_TO_LANDING ?
+             State::RETURN_ACTIVE : State::MISSION_ACTIVE;
+           cancel_intent_ = CancelIntent::NONE;
++
++          if (resume_after_pause_) {
++            resume_after_pause_ = false;
++            pending_pause_request_ = false;
++          }
+         }
+       });
+   }
+@@ -711,6 +1075,13 @@
+             drone_namespace_.c_str());
+           if (pending_stop_request_) {
+             state_ = State::RETURN_DISPATCH;
++          } else if (pending_pause_request_) {
++            pending_pause_request_ = false;
++            state_ = State::PAUSED;
++            RCLCPP_WARN(
++              get_logger(),
++              "[/%s] TAKEOFF completed while PAUSE was pending; controller remains in HOLD",
++              drone_namespace_.c_str());
+           } else {
+             state_ = State::MISSION_DISPATCH;
+           }
+@@ -821,11 +1192,25 @@
+           deviation_active_ = false;
+ 
+           if (intent == CancelIntent::PAUSE) {
+-            state_ = State::PAUSED;
+             pending_pause_request_ = false;
+-            RCLCPP_INFO(
+-              get_logger(), "[/%s] Mission PAUSED at global waypoint %zu; controller is in HOLD",
+-              drone_namespace_.c_str(), current_global_waypoint_);
++
++            if (resume_after_pause_) {
++              resume_after_pause_ = false;
++              state_ = State::MISSION_DISPATCH;
++              next_attempt_at_ = std::chrono::steady_clock::now();
++              RCLCPP_INFO(
++                get_logger(),
++                "[/%s] PAUSE cancellation completed but RESUME was queued; "
++                "remaining mission will be dispatched immediately",
++                drone_namespace_.c_str());
++            } else {
++              state_ = State::PAUSED;
++              RCLCPP_INFO(
++                get_logger(),
++                "[/%s] Mission PAUSED at global waypoint %zu; controller is in HOLD",
++                drone_namespace_.c_str(),
++                current_global_waypoint_);
++            }
+             return;
+           }
+ 
+@@ -877,39 +1262,77 @@
+   void process_pending_commands()
+   {
+     if (pending_stop_request_) {
+-      if (state_ == State::WAITING_START) {
++      if (
++        state_ == State::WAITING_START ||
++        state_ == State::PAUSED_BEFORE_START ||
++        state_ == State::TAKEOFF_REQUEST)
++      {
+         RCLCPP_WARN(
+-          get_logger(), "[/%s] TOTAL STOP before operation start: occurrence canceled without flight commands",
++          get_logger(),
++          "[/%s] TOTAL STOP before takeoff: occurrence canceled without flight commands",
+           drone_namespace_.c_str());
++
+         pending_stop_request_ = false;
++        pending_pause_request_ = false;
++        resume_after_pause_ = false;
+         complete_current_occurrence();
+         return;
+       }
+-      if (active_goal_handle_ &&
+-        (state_ == State::MISSION_ACTIVE || state_ == State::RETURN_ACTIVE))
++
++      if (
++        active_goal_handle_ &&
++        (state_ == State::MISSION_ACTIVE ||
++        state_ == State::RETURN_ACTIVE))
+       {
+-        request_goal_cancellation(CancelIntent::STOP);
++        request_goal_cancellation(
++          CancelIntent::STOP);
+         return;
+       }
+-      if (state_ == State::TAKEOFF_REQUEST) {
+-        RCLCPP_WARN(
+-          get_logger(), "[/%s] TOTAL STOP before TAKEOFF request was sent: occurrence canceled without flight commands",
+-          drone_namespace_.c_str());
++
++      if (
++        state_ == State::PAUSED ||
++        state_ == State::MISSION_DISPATCH)
++      {
+         pending_stop_request_ = false;
+-        complete_current_occurrence();
++        pending_pause_request_ = false;
++        resume_after_pause_ = false;
++        state_ =
++          State::RETURN_DISPATCH;
++
++        next_attempt_at_ =
++          std::chrono::steady_clock::now();
+         return;
+       }
+-      if (state_ == State::PAUSED || state_ == State::MISSION_DISPATCH)
+-      {
+-        pending_stop_request_ = false;
+-        state_ = State::RETURN_DISPATCH;
+-        next_attempt_at_ = std::chrono::steady_clock::now();
+-        return;
+-      }
+-    }
+-
+-    if (pending_pause_request_ && state_ == State::MISSION_ACTIVE && active_goal_handle_) {
+-      request_goal_cancellation(CancelIntent::PAUSE);
++    }
++
++    if (!pending_pause_request_) {
++      return;
++    }
++
++    if (
++      state_ == State::WAITING_START ||
++      state_ == State::TAKEOFF_REQUEST)
++    {
++      pending_pause_request_ = false;
++      supervision_start_delay_authorized_ = true;
++      state_ =
++        State::PAUSED_BEFORE_START;
++      return;
++    }
++
++    if (state_ == State::MISSION_DISPATCH) {
++      pending_pause_request_ = false;
++      state_ =
++        State::PAUSED;
++      return;
++    }
++
++    if (
++      state_ == State::MISSION_ACTIVE &&
++      active_goal_handle_)
++    {
++      request_goal_cancellation(
++        CancelIntent::PAUSE);
+     }
+   }
+ 
+@@ -920,6 +1343,7 @@
+ 
+     switch (state_) {
+       case State::WAITING_TRAJECTORY:
++      case State::PAUSED_BEFORE_START:
+       case State::PAUSE_CANCELING:
+       case State::PAUSED:
+       case State::STOP_CANCELING:
+@@ -941,11 +1365,28 @@
+           return;
+         }
+         const double lateness_s = static_cast<double>(now_ns - start_ns) / 1.0e9;
+-        if (lateness_s > max_start_lateness_s_) {
++        if (
++          lateness_s > max_start_lateness_s_ &&
++          !supervision_start_delay_authorized_)
++        {
+           remember_completed(active_occurrence_key_);
+           fail("operation start was missed by " + std::to_string(lateness_s) + " s");
+           return;
+         }
++
++        if (
++          lateness_s > max_start_lateness_s_ &&
++          supervision_start_delay_authorized_)
++        {
++          RCLCPP_WARN(
++            get_logger(),
++            "[/%s] Operation start lateness %.3f s accepted because supervision "
++            "explicitly paused the trajectory before takeoff",
++            drone_namespace_.c_str(),
++            lateness_s);
++        }
++
++        supervision_start_delay_authorized_ = false;
+         state_ = State::TAKEOFF_REQUEST;
+         next_attempt_at_ = steady_now;
+         RCLCPP_INFO(
+@@ -1017,6 +1458,8 @@
+     cancel_intent_ = CancelIntent::NONE;
+     pending_pause_request_ = false;
+     pending_stop_request_ = false;
++    resume_after_pause_ = false;
++    supervision_start_delay_authorized_ = false;
+     deviation_active_ = false;
+     state_ = State::WAITING_TRAJECTORY;
+   }
+@@ -1026,6 +1469,7 @@
+     switch (state) {
+       case State::WAITING_TRAJECTORY: return "WAITING_TRAJECTORY";
+       case State::WAITING_START: return "WAITING_START";
++      case State::PAUSED_BEFORE_START: return "PAUSED_BEFORE_START";
+       case State::TAKEOFF_REQUEST: return "TAKEOFF_REQUEST";
+       case State::TAKEOFF_RESPONSE: return "TAKEOFF_RESPONSE";
+       case State::MISSION_DISPATCH: return "MISSION_DISPATCH";
+@@ -1048,11 +1492,12 @@
+   std::string drone_namespace_;
+   std::string odom_frame_;
+   std::string expected_action_name_;
+-
+-  std::string active_trajectories_topic_;
++  std::string supervision_action_name_;
++
+   std::string odom_frame_suffix_;
+   std::string arm_takeoff_service_suffix_;
+   std::string follow_waypoints_action_suffix_;
++  std::string supervision_action_suffix_;
+   std::string operator_service_suffix_;
+ 
+   int tick_period_ms_{100};
+@@ -1079,6 +1524,9 @@
+ 
+   bool pending_pause_request_{false};
+   bool pending_stop_request_{false};
++  bool resume_after_pause_{false};
++  bool supervision_start_delay_authorized_{false};
++  bool preemptive_pause_latch_{false};
+   bool cancel_request_in_flight_{false};
+   bool deviation_active_{false};
+   double last_path_deviation_m_{0.0};
+@@ -1089,10 +1537,10 @@
+   std::deque<std::string> completed_keys_;
+   std::set<std::string> completed_keys_set_;
+ 
+-  rclcpp::Subscription<StaticTrajectoryArray>::SharedPtr active_subscription_;
+   rclcpp::Client<ArmTakeoff>::SharedPtr arm_takeoff_client_;
+   FollowWaypointsClient::SharedPtr follow_waypoints_client_;
+   rclcpp::Service<ControlTrajectory>::SharedPtr operator_service_;
++  SupervisionControlServer::SharedPtr supervision_action_server_;
+   GoalHandleFollowWaypoints::SharedPtr active_goal_handle_;
+   rclcpp::TimerBase::SharedPtr tick_timer_;
+ 
