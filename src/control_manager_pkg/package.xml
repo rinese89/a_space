@@ -1,13 +1,13 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>control_manager_pkg</name>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 
   <description>
-    Per-UAS ROS 2 Humble control manager. Trajectories are acquired through
-    flight_zone_supervision/SupervisionControl instead of subscribing directly
-    to /active_trajectories. Existing takeoff, mission, pause/resume, stop,
-    trajectory monitoring and landing behavior is preserved.
+    Per-UAS ROS 2 Humble control manager adapted to multi-mission
+    StaticTrajectory messages. Executes each mission component independently,
+    preserves pause/resume progress and supports a distinct scalar height per
+    mission component.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>

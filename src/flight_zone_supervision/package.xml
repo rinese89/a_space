@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>flight_zone_supervision</name>
-  <version>0.3.0</version>
-  <description>Per-flight-zone supervision node with two-stage supervised deconfliction: primary control of the supervised UAS, then counterpart hold until the supervised UAS clears the original collision geometry.</description>
+  <version>0.4.0</version>
+  <description>Per-flight-zone multi-mission supervision with collision-segment proximity activation, UAS safety-distance control, escalation and counterpart hold until collision clearance.</description>
   <maintainer email="maintainer@example.com">A-space</maintainer>
   <license>Apache-2.0</license>
 

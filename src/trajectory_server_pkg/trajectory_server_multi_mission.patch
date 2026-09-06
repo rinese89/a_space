@@ -1,0 +1,415 @@
+--- trajectory_server_node_previous.cpp
++++ src/trajectory_server_node.cpp
+@@ -83,12 +83,6 @@
+   double z{0.0};
+ };
+ 
+-struct TaggedPoint
+-{
+-  Vec3 point;
+-  Phase phase{Phase::MISSION};
+-};
+-
+ struct GeometrySegment
+ {
+   Vec3 start;
+@@ -304,19 +298,32 @@
+   return points;
+ }
+ 
+-static void append_tagged_points(
+-  std::vector<TaggedPoint> & target,
+-  const std::vector<Vec3> & source,
+-  Phase phase)
+-{
+-  for (const auto & point : source) {
+-    target.push_back(TaggedPoint{point, phase});
+-  }
+-}
+-
+-static Phase connection_phase(const TaggedPoint & start, const TaggedPoint & end)
+-{
+-  return start.phase == end.phase ? start.phase : end.phase;
++static void append_polyline_segments(
++  std::vector<GeometrySegment> & target,
++  const std::vector<Vec3> & points,
++  Phase phase,
++  uint32_t & phase_segment_index)
++{
++  if (points.size() < 2U) {
++    return;
++  }
++
++  target.reserve(
++    target.size() +
++    points.size() - 1U);
++
++  for (
++    std::size_t index = 1U;
++    index < points.size();
++    ++index)
++  {
++    target.push_back(
++      GeometrySegment{
++        points[index - 1U],
++        points[index],
++        phase,
++        phase_segment_index++});
++  }
+ }
+ 
+ static std::vector<GeometrySegment> build_geometry_segments(
+@@ -328,46 +335,112 @@
+       "Trajectory '" + trajectory.trajectory_id + "': repetitions must be >= 1");
+   }
+ 
+-  const auto takeoff = segment_points(
+-    trajectory.takeoff, trajectory.trajectory_id, "takeoff", allow_empty_phases);
+-  const auto mission = segment_points(
+-    trajectory.mission, trajectory.trajectory_id, "mission", allow_empty_phases);
+-  const auto landing = segment_points(
+-    trajectory.landing, trajectory.trajectory_id, "landing", allow_empty_phases);
+-
+-  std::vector<TaggedPoint> expanded;
+-  expanded.reserve(
+-    takeoff.size() + mission.size() * trajectory.repetitions + landing.size());
+-
+-  append_tagged_points(expanded, takeoff, Phase::TAKEOFF);
+-  for (uint32_t repetition = 0U; repetition < trajectory.repetitions; ++repetition) {
+-    append_tagged_points(expanded, mission, Phase::MISSION);
+-  }
+-  append_tagged_points(expanded, landing, Phase::LANDING);
+-
+-  if (expanded.size() < 2U) {
+-    if (allow_empty_phases) {
+-      return {};
+-    }
++  const auto takeoff =
++    segment_points(
++      trajectory.takeoff,
++      trajectory.trajectory_id,
++      "takeoff",
++      allow_empty_phases);
++
++  const auto landing =
++    segment_points(
++      trajectory.landing,
++      trajectory.trajectory_id,
++      "landing",
++      allow_empty_phases);
++
++  if (
++    trajectory.mission.empty() &&
++    !allow_empty_phases)
++  {
+     throw std::runtime_error(
+-      "Trajectory '" + trajectory.trajectory_id + "': expanded geometry has fewer than 2 points");
+-  }
+-
+-  std::array<uint32_t, 3U> phase_indices{0U, 0U, 0U};
++      "Trajectory '" +
++      trajectory.trajectory_id +
++      "': mission array is empty");
++  }
++
++  std::vector<
++    std::vector<Vec3>> missions;
++
++  missions.reserve(
++    trajectory.mission.size());
++
++  for (
++    std::size_t mission_index = 0U;
++    mission_index < trajectory.mission.size();
++    ++mission_index)
++  {
++    missions.push_back(
++      segment_points(
++        trajectory.mission[mission_index],
++        trajectory.trajectory_id,
++        "mission[" +
++        std::to_string(mission_index) +
++        "]",
++        allow_empty_phases));
++  }
++
+   std::vector<GeometrySegment> segments;
+-  segments.reserve(expanded.size() - 1U);
+-
+-  for (std::size_t index = 1U; index < expanded.size(); ++index) {
+-    const Phase phase = connection_phase(expanded[index - 1U], expanded[index]);
+-    const auto slot = static_cast<std::size_t>(phase);
+-    const uint32_t phase_index = phase_indices.at(slot)++;
+-    segments.push_back(GeometrySegment{
+-      expanded[index - 1U].point,
+-      expanded[index].point,
+-      phase,
+-      phase_index});
+-  }
+-
++
++  std::size_t geometry_segment_count = 0U;
++
++  if (takeoff.size() >= 2U) {
++    geometry_segment_count +=
++      takeoff.size() - 1U;
++  }
++
++  for (const auto & mission : missions) {
++    if (mission.size() >= 2U) {
++      geometry_segment_count +=
++        mission.size() - 1U;
++    }
++  }
++
++  if (landing.size() >= 2U) {
++    geometry_segment_count +=
++      landing.size() - 1U;
++  }
++
++  segments.reserve(
++    geometry_segment_count);
++
++  uint32_t takeoff_segment_index = 0U;
++  uint32_t mission_segment_index = 0U;
++  uint32_t landing_segment_index = 0U;
++
++  // Every TrajectorySegment is an independent continuous polyline.
++  //
++  // In particular, there is NO implicit spatial edge between:
++  //   takeoff.back()        -> mission[0].front()
++  //   mission[i].back()     -> mission[i + 1].front()
++  //   mission.back().back() -> landing.front()
++  //
++  // This is required for supervised crops: separate collision-free mission
++  // pieces must remain spatially disconnected.
++  append_polyline_segments(
++    segments,
++    takeoff,
++    Phase::TAKEOFF,
++    takeoff_segment_index);
++
++  for (const auto & mission : missions) {
++    append_polyline_segments(
++      segments,
++      mission,
++      Phase::MISSION,
++      mission_segment_index);
++  }
++
++  append_polyline_segments(
++    segments,
++    landing,
++    Phase::LANDING,
++    landing_segment_index);
++
++  // Partial repetitions repeat the same mission collection geometrically.
++  // Runtime arbitration only needs unique spatial geometry. Duplicating the
++  // same edges repetitions times would multiply identical collision evidence
++  // without changing the collision decision.
+   return segments;
+ }
+ 
+@@ -438,25 +511,6 @@
+   return static_cast<uint8_t>(phase);
+ }
+ 
+-static std::vector<Vec3> marker_points(const StaticTrajectory & trajectory)
+-{
+-  std::vector<Vec3> output;
+-  auto append = [&output](const TrajectorySegment & segment) {
+-      const std::size_t size = std::min({segment.x.size(), segment.y.size(), segment.z.size()});
+-      for (std::size_t index = 0U; index < size; ++index) {
+-        output.push_back(Vec3{segment.x[index], segment.y[index], segment.z[index]});
+-      }
+-    };
+-
+-  append(trajectory.takeoff);
+-  for (uint32_t repetition = 0U; repetition < std::max<uint32_t>(1U, trajectory.repetitions);
+-    ++repetition)
+-  {
+-    append(trajectory.mission);
+-  }
+-  append(trajectory.landing);
+-  return output;
+-}
+ 
+ static std_msgs::msg::ColorRGBA color_from_trajectory_id(const std::string & trajectory_id)
+ {
+@@ -687,6 +741,25 @@
+     return true;
+   }
+ 
++  static bool mission_coordinates_valid(
++    const std::vector<TrajectorySegment> & missions,
++    bool allow_empty_phase)
++  {
++    if (missions.empty()) {
++      return allow_empty_phase;
++    }
++
++    for (const auto & mission : missions) {
++      // An empty mission component has no useful semantics. A fully removed
++      // MISSION phase is represented by an empty mission array instead.
++      if (!segment_coordinates_valid(mission, false)) {
++        return false;
++      }
++    }
++
++    return true;
++  }
++
+   bool is_supervised_id_locked(const std::string & trajectory_id) const
+   {
+     return latest_supervised_.find(trajectory_id) != latest_supervised_.end();
+@@ -700,13 +773,16 @@
+       return false;
+     }
+ 
+-    // Normal trajectories keep the original strict requirement: every phase
+-    // must contain geometry. A supervised trajectory is special because its
+-    // AVAILABLE copy is the deliberately cropped version and TAKEOFF, MISSION
+-    // or LANDING may therefore be empty.
++    // Normal trajectories keep the strict requirement: TAKEOFF, at least one
++    // MISSION component and LANDING must contain valid geometry.
++    //
++    // A supervised trajectory is special because its AVAILABLE copy is the
++    // deliberately cropped version. TAKEOFF or LANDING may be empty and the
++    // complete MISSION phase may be represented by an empty mission array.
++    // If mission components are present, each component must itself be valid.
+     return
+       segment_coordinates_valid(trajectory.takeoff, supervised) &&
+-      segment_coordinates_valid(trajectory.mission, supervised) &&
++      mission_coordinates_valid(trajectory.mission, supervised) &&
+       segment_coordinates_valid(trajectory.landing, supervised);
+   }
+ 
+@@ -1354,49 +1430,106 @@
+     const rclcpp::Time & stamp,
+     MarkerArray & marker_array) const
+   {
+-    const auto points = marker_points(trajectory);
+-    if (points.empty()) {
++    const bool supervised =
++      is_supervised_id_locked(
++      trajectory.trajectory_id);
++
++    std::vector<GeometrySegment> geometry;
++
++    try {
++      geometry =
++        build_geometry_segments(
++        trajectory,
++        supervised);
++    } catch (const std::exception & error) {
++      RCLCPP_WARN(
++        get_logger(),
++        "Could not create ACTIVE marker for '%s': %s",
++        trajectory.trajectory_id.c_str(),
++        error.what());
++
+       return;
+     }
+ 
+-    const auto color = color_from_trajectory_id(trajectory.trajectory_id);
+-    const std::string frame_id = trajectory.frame_id.empty() ? "map" : trajectory.frame_id;
+-    const std::string ns = "active_trajectory/" + trajectory.trajectory_id;
+-
++    if (geometry.empty()) {
++      return;
++    }
++
++    const auto marker_color =
++      color_from_trajectory_id(
++      trajectory.trajectory_id);
++
++    const std::string frame_id =
++      trajectory.frame_id.empty() ?
++      "map" :
++      trajectory.frame_id;
++
++    const std::string marker_namespace =
++      "active_trajectory/" +
++      trajectory.trajectory_id;
++
++    // LINE_LIST is deliberate. A LINE_STRIP would reconnect separate mission
++    // components and visually invent geometry across cropped gaps.
+     Marker line;
+     line.header.frame_id = frame_id;
+     line.header.stamp = stamp;
+-    line.ns = ns;
++    line.ns = marker_namespace;
+     line.id = 0;
+-    line.type = Marker::LINE_STRIP;
++    line.type = Marker::LINE_LIST;
+     line.action = Marker::ADD;
+     line.pose.orientation.w = 1.0;
+     line.scale.x = marker_line_width_;
+-    line.color = color;
+-    for (const auto & point : points) {
+-      line.points.push_back(to_point(point));
+-    }
+-    marker_array.markers.push_back(std::move(line));
++    line.color = marker_color;
++
++    for (const auto & segment : geometry) {
++      line.points.push_back(
++        to_point(segment.start));
++      line.points.push_back(
++        to_point(segment.end));
++    }
++
++    marker_array.markers.push_back(
++      std::move(line));
+ 
+     Marker text;
+     text.header.frame_id = frame_id;
+     text.header.stamp = stamp;
+-    text.ns = ns;
++    text.ns = marker_namespace;
+     text.id = 1;
+     text.type = Marker::TEXT_VIEW_FACING;
+     text.action = Marker::ADD;
+     text.pose.orientation.w = 1.0;
+-    text.pose.position = to_point(points.front());
+-    text.pose.position.z += marker_text_height_ * 1.8;
+-    text.scale.z = marker_text_height_;
+-    text.color = color;
++    text.pose.position =
++      to_point(
++      geometry.front().start);
++    text.pose.position.z +=
++      marker_text_height_ * 1.8;
++    text.scale.z =
++      marker_text_height_;
++    text.color =
++      marker_color;
+ 
+     std::ostringstream label;
+-    label << "ACTIVE " << trajectory.trajectory_id << " | P=" << trajectory.priority << "\n"
+-          << "start: " << format_utc_iso8601(trajectory.operation_start_utc) << "\n"
+-          << "end:   " << format_utc_iso8601(trajectory.operation_end_utc);
++    label
++      << "ACTIVE "
++      << trajectory.trajectory_id
++      << " | P="
++      << trajectory.priority
++      << " | M="
++      << trajectory.mission.size()
++      << "\n"
++      << "start: "
++      << format_utc_iso8601(
++      trajectory.operation_start_utc)
++      << "\n"
++      << "end:   "
++      << format_utc_iso8601(
++      trajectory.operation_end_utc);
++
+     text.text = label.str();
+-    marker_array.markers.push_back(std::move(text));
++
++    marker_array.markers.push_back(
++      std::move(text));
+   }
+ 
+   void publish_active_snapshot_locked(

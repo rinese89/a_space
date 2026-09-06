@@ -1,12 +1,13 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>deconfliction_manager</name>
-  <version>0.5.0</version>
+  <version>0.6.0</version>
 
   <description>
-    Classifies detected collision trajectories using unique virtual-net node
-    count and publishes supervision requests containing the original collision
-    detection payload plus a geometry-only virtual-net crop.
+    Multi-mission deconfliction manager. Classifies using unique virtual-net
+    collision nodes and produces the authoritative cropped StaticTrajectory,
+    preserving independent mission components and splitting retained mission
+    geometry into multiple mission[] polylines when required.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>

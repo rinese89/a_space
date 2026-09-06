@@ -315,29 +315,61 @@ private:
       reason = "action_name does not match this UAS: expected '" + expected_action_name_ + "'";
       return false;
     }
-    if (!segment_valid(trajectory.takeoff, 2U) || !segment_valid(trajectory.mission, 2U) ||
+    if (!segment_valid(trajectory.takeoff, 2U) ||
+      trajectory.mission.empty() ||
       !segment_valid(trajectory.landing, 2U))
     {
-      reason = "takeoff/mission/landing segment geometry is invalid";
+      reason = "takeoff/mission[]/landing geometry is invalid or mission[] is empty";
       return false;
     }
+
+    for (std::size_t mission_index = 0U;
+      mission_index < trajectory.mission.size();
+      ++mission_index)
+    {
+      const auto & mission =
+        trajectory.mission[mission_index];
+
+      if (!segment_valid(mission, 2U)) {
+        reason =
+          "mission[" +
+          std::to_string(mission_index) +
+          "] geometry is invalid";
+        return false;
+      }
+
+      // FollowWaypoints exposes one scalar height per action. Because each
+      // mission[i] is dispatched as an independent action, different mission
+      // components may use different heights, but each individual component
+      // must be planar in Z.
+      const double mission_height =
+        mission.z.front();
+
+      if (mission_height <= 0.0) {
+        reason =
+          "mission[" +
+          std::to_string(mission_index) +
+          "] height must be positive";
+        return false;
+      }
+
+      for (const double z : mission.z) {
+        if (std::abs(z - mission_height) > 1.0e-6) {
+          reason =
+            "FollowWaypoints supports one scalar height per action; mission[" +
+            std::to_string(mission_index) +
+            "].z must be constant";
+          return false;
+        }
+      }
+    }
+
     if (!finite(trajectory.goal_tolerance) || trajectory.goal_tolerance <= 0.0 ||
       !finite(trajectory.slowdown_radius) || trajectory.slowdown_radius <= 0.0 ||
       trajectory.repetitions < 1U)
     {
       reason = "goal_tolerance, slowdown_radius or repetitions is invalid";
       return false;
-    }
-    const double mission_height = trajectory.mission.z.front();
-    if (mission_height <= 0.0) {
-      reason = "mission height must be positive";
-      return false;
-    }
-    for (const double z : trajectory.mission.z) {
-      if (std::abs(z - mission_height) > 1.0e-6) {
-        reason = "FollowWaypoints supports one scalar mission height; mission.z must be constant";
-        return false;
-      }
     }
     if (time_to_ns(trajectory.operation_end_utc) <= time_to_ns(trajectory.operation_start_utc)) {
       reason = "operation_end_utc must be later than operation_start_utc";
@@ -523,7 +555,7 @@ private:
         {
           active_trajectory_ =
             trajectory;
-          build_expanded_mission();
+          initialize_mission_execution();
         }
 
         message =
@@ -552,7 +584,7 @@ private:
     active_occurrence_key_ =
       key;
 
-    build_expanded_mission();
+    initialize_mission_execution();
 
     state_ =
       State::WAITING_START;
@@ -578,7 +610,8 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "[/%s] Acquired trajectory by supervision action '%s' | P%d | "
-      "start_ns=%ld | mission_points=%zu | spacial_conflict=%s%s",
+      "start_ns=%ld | missions=%zu | repetitions=%u | total_mission_points=%zu | "
+      "spacial_conflict=%s%s",
       drone_namespace_.c_str(),
       active_trajectory_->trajectory_id.c_str(),
       active_trajectory_->priority,
@@ -586,7 +619,9 @@ private:
         time_to_ns(
           active_trajectory_->
           operation_start_utc)),
-      mission_path_map_.size(),
+      active_trajectory_->mission.size(),
+      active_trajectory_->repetitions,
+      total_mission_waypoints(*active_trajectory_),
       active_trajectory_->spacial_conflict ?
       "true" :
       "false",
@@ -784,21 +819,105 @@ private:
     return true;
   }
 
-  void build_expanded_mission()
+  static std::size_t total_mission_waypoints(
+    const StaticTrajectory & trajectory)
+  {
+    std::size_t one_pass = 0U;
+
+    for (const auto & mission : trajectory.mission) {
+      one_pass += mission.x.size();
+    }
+
+    return
+      one_pass *
+      static_cast<std::size_t>(
+      trajectory.repetitions);
+  }
+
+  const TrajectorySegment * current_mission_segment() const
+  {
+    if (
+      !active_trajectory_ ||
+      active_trajectory_->mission.empty() ||
+      current_mission_index_ >=
+      active_trajectory_->mission.size())
+    {
+      return nullptr;
+    }
+
+    return
+      &active_trajectory_->
+      mission[current_mission_index_];
+  }
+
+  void load_current_mission_path()
   {
     mission_path_map_.clear();
-    if (!active_trajectory_) {
+
+    const auto * mission =
+      current_mission_segment();
+
+    if (mission == nullptr) {
       return;
     }
-    const auto & mission = active_trajectory_->mission;
-    mission_path_map_.reserve(mission.x.size() * active_trajectory_->repetitions);
-    for (uint32_t rep = 0U; rep < active_trajectory_->repetitions; ++rep) {
-      for (std::size_t i = 0U; i < mission.x.size(); ++i) {
-        mission_path_map_.push_back(Point3{mission.x[i], mission.y[i], mission.z[i]});
-      }
+
+    mission_path_map_.reserve(
+      mission->x.size());
+
+    for (std::size_t i = 0U;
+      i < mission->x.size();
+      ++i)
+    {
+      mission_path_map_.push_back(
+        Point3{
+          mission->x[i],
+          mission->y[i],
+          mission->z[i]});
     }
-    current_global_waypoint_ = 0U;
+  }
+
+  void initialize_mission_execution()
+  {
+    current_repetition_ = 0U;
+    current_mission_index_ = 0U;
+    current_mission_waypoint_ = 0U;
     action_base_index_ = 0U;
+    action_mission_index_ = 0U;
+    action_repetition_ = 0U;
+
+    load_current_mission_path();
+  }
+
+  bool advance_to_next_mission_component()
+  {
+    if (
+      !active_trajectory_ ||
+      active_trajectory_->mission.empty())
+    {
+      return false;
+    }
+
+    if (
+      current_mission_index_ + 1U <
+      active_trajectory_->mission.size())
+    {
+      ++current_mission_index_;
+    } else {
+      if (
+        current_repetition_ + 1U >=
+        active_trajectory_->repetitions)
+      {
+        return false;
+      }
+
+      ++current_repetition_;
+      current_mission_index_ = 0U;
+    }
+
+    current_mission_waypoint_ = 0U;
+    action_base_index_ = 0U;
+    load_current_mission_path();
+    return true;
   }
 
   void operator_control_callback(
@@ -930,9 +1049,14 @@ private:
 
   void process_mission_feedback(const FollowWaypoints::Feedback & feedback)
   {
-    current_global_waypoint_ = std::min<std::size_t>(
-      action_base_index_ + static_cast<std::size_t>(feedback.current_waypoint),
-      mission_path_map_.empty() ? 0U : mission_path_map_.size() - 1U);
+    current_mission_waypoint_ =
+      std::min<std::size_t>(
+      action_base_index_ +
+      static_cast<std::size_t>(
+        feedback.current_waypoint),
+      mission_path_map_.empty() ?
+      0U :
+      mission_path_map_.size() - 1U);
 
     const auto now_steady = std::chrono::steady_clock::now();
     if (now_steady - mission_started_at_ < std::chrono::duration<double>(deviation_grace_period_s_)) {
@@ -965,9 +1089,14 @@ private:
       deviation_started_at_ = now_steady;
       RCLCPP_WARN(
         get_logger(),
-        "[/%s] Path deviation detected from action feedback | trajectory='%s' | distance=%.3f m | limit=%.3f m",
-        drone_namespace_.c_str(), active_trajectory_->trajectory_id.c_str(),
-        distance, max_path_deviation_m_);
+        "[/%s] Path deviation detected | trajectory='%s' | repetition=%u | "
+        "mission=%zu | distance=%.3f m | limit=%.3f m",
+        drone_namespace_.c_str(),
+        active_trajectory_->trajectory_id.c_str(),
+        current_repetition_,
+        current_mission_index_,
+        distance,
+        max_path_deviation_m_);
       return;
     }
 
@@ -1106,23 +1235,62 @@ private:
     }
 
     FollowWaypoints::Goal goal;
-    std::size_t base_index = current_global_waypoint_;
+    std::size_t base_index = 0U;
 
     if (purpose == ActionPurpose::MISSION) {
-      if (mission_path_map_.empty() || base_index >= mission_path_map_.size()) {
-        state_ = State::LANDING_REQUEST;
-        next_attempt_at_ = std::chrono::steady_clock::now();
+      const auto * mission =
+        current_mission_segment();
+
+      if (
+        mission == nullptr ||
+        mission_path_map_.empty())
+      {
+        fail(
+          "current mission component is unavailable");
         return;
       }
-      goal.x.reserve(mission_path_map_.size() - base_index);
-      goal.y.reserve(mission_path_map_.size() - base_index);
-      for (std::size_t i = base_index; i < mission_path_map_.size(); ++i) {
-        goal.x.push_back(mission_path_map_[i].x);
-        goal.y.push_back(mission_path_map_[i].y);
+
+      base_index =
+        current_mission_waypoint_;
+
+      if (base_index >= mission_path_map_.size()) {
+        if (advance_to_next_mission_component()) {
+          state_ = State::MISSION_DISPATCH;
+        } else {
+          state_ = State::LANDING_REQUEST;
+        }
+
+        next_attempt_at_ =
+          std::chrono::steady_clock::now();
+        return;
       }
-      goal.height = mission_path_map_.front().z;
-      goal.goal_tolerance = active_trajectory_->goal_tolerance;
-      goal.slowdown_radius = active_trajectory_->slowdown_radius;
+
+      goal.x.reserve(
+        mission_path_map_.size() -
+        base_index);
+      goal.y.reserve(
+        mission_path_map_.size() -
+        base_index);
+
+      for (std::size_t i = base_index;
+        i < mission_path_map_.size();
+        ++i)
+      {
+        goal.x.push_back(
+          mission_path_map_[i].x);
+        goal.y.push_back(
+          mission_path_map_[i].y);
+      }
+
+      // Each mission[i] has already been validated to have one constant scalar
+      // Z, so each component may be dispatched with its own FollowWaypoints
+      // height.
+      goal.height =
+        mission->z.front();
+      goal.goal_tolerance =
+        active_trajectory_->goal_tolerance;
+      goal.slowdown_radius =
+        active_trajectory_->slowdown_radius;
       goal.repetitions = 1U;
     } else {
       const auto & landing = active_trajectory_->landing;
@@ -1143,7 +1311,16 @@ private:
 
     action_purpose_ = purpose;
     action_base_index_ = base_index;
-    const std::string trajectory_id = active_trajectory_->trajectory_id;
+
+    if (purpose == ActionPurpose::MISSION) {
+      action_mission_index_ =
+        current_mission_index_;
+      action_repetition_ =
+        current_repetition_;
+    }
+
+    const std::string trajectory_id =
+      active_trajectory_->trajectory_id;
 
     rclcpp_action::Client<FollowWaypoints>::SendGoalOptions options;
     options.goal_response_callback =
@@ -1161,10 +1338,26 @@ private:
         deviation_active_ = false;
         mission_started_at_ = std::chrono::steady_clock::now();
         state_ = purpose == ActionPurpose::MISSION ? State::MISSION_ACTIVE : State::RETURN_ACTIVE;
-        RCLCPP_INFO(
-          get_logger(), "[/%s] %s action accepted | trajectory='%s' | base_waypoint=%zu",
-          drone_namespace_.c_str(), purpose == ActionPurpose::MISSION ? "MISSION" : "RETURN",
-          trajectory_id.c_str(), action_base_index_);
+        if (purpose == ActionPurpose::MISSION) {
+          RCLCPP_INFO(
+            get_logger(),
+            "[/%s] MISSION action accepted | trajectory='%s' | repetition=%u | "
+            "mission=%zu/%zu | base_waypoint=%zu",
+            drone_namespace_.c_str(),
+            trajectory_id.c_str(),
+            action_repetition_,
+            action_mission_index_,
+            active_trajectory_ ?
+            active_trajectory_->mission.size() :
+            0U,
+            action_base_index_);
+        } else {
+          RCLCPP_INFO(
+            get_logger(),
+            "[/%s] RETURN action accepted | trajectory='%s'",
+            drone_namespace_.c_str(),
+            trajectory_id.c_str());
+        }
       };
 
     options.feedback_callback =
@@ -1207,9 +1400,12 @@ private:
               state_ = State::PAUSED;
               RCLCPP_INFO(
                 get_logger(),
-                "[/%s] Mission PAUSED at global waypoint %zu; controller is in HOLD",
+                "[/%s] Mission PAUSED | repetition=%u | mission=%zu | waypoint=%zu; "
+                "controller is in HOLD",
                 drone_namespace_.c_str(),
-                current_global_waypoint_);
+                current_repetition_,
+                current_mission_index_,
+                current_mission_waypoint_);
             }
             return;
           }
@@ -1230,12 +1426,47 @@ private:
 
         if (purpose == ActionPurpose::MISSION) {
           if (success) {
-            current_global_waypoint_ = mission_path_map_.size();
-            state_ = State::LANDING_REQUEST;
-            next_attempt_at_ = std::chrono::steady_clock::now();
-            RCLCPP_INFO(
-              get_logger(), "[/%s] Mission '%s' completed; sending landing service",
-              drone_namespace_.c_str(), trajectory_id.c_str());
+            current_mission_waypoint_ =
+              mission_path_map_.size();
+
+            const uint32_t completed_repetition =
+              current_repetition_;
+            const std::size_t completed_mission =
+              current_mission_index_;
+
+            if (advance_to_next_mission_component()) {
+              state_ = State::MISSION_DISPATCH;
+              next_attempt_at_ =
+                std::chrono::steady_clock::now();
+
+              RCLCPP_INFO(
+                get_logger(),
+                "[/%s] Mission component completed | trajectory='%s' | "
+                "repetition=%u | mission=%zu -> next repetition=%u mission=%zu",
+                drone_namespace_.c_str(),
+                trajectory_id.c_str(),
+                completed_repetition,
+                completed_mission,
+                current_repetition_,
+                current_mission_index_);
+            } else {
+              state_ = State::LANDING_REQUEST;
+              next_attempt_at_ =
+                std::chrono::steady_clock::now();
+
+              RCLCPP_INFO(
+                get_logger(),
+                "[/%s] Complete mission collection '%s' finished | "
+                "repetitions=%u | missions_per_repetition=%zu; sending landing service",
+                drone_namespace_.c_str(),
+                trajectory_id.c_str(),
+                active_trajectory_ ?
+                active_trajectory_->repetitions :
+                0U,
+                active_trajectory_ ?
+                active_trajectory_->mission.size() :
+                0U);
+            }
           } else {
             pending_stop_request_ = false;
             state_ = State::RETURN_DISPATCH;
@@ -1452,8 +1683,12 @@ private:
     active_trajectory_.reset();
     active_occurrence_key_.clear();
     mission_path_map_.clear();
-    current_global_waypoint_ = 0U;
+    current_repetition_ = 0U;
+    current_mission_index_ = 0U;
+    current_mission_waypoint_ = 0U;
     action_base_index_ = 0U;
+    action_mission_index_ = 0U;
+    action_repetition_ = 0U;
     action_purpose_ = ActionPurpose::NONE;
     cancel_intent_ = CancelIntent::NONE;
     pending_pause_request_ = false;
@@ -1518,9 +1753,23 @@ private:
 
   std::optional<StaticTrajectory> active_trajectory_;
   std::string active_occurrence_key_;
+  // Geometry of the single mission[i] currently being executed. Independent
+  // mission components are never concatenated into this vector.
   std::vector<Point3> mission_path_map_;
-  std::size_t current_global_waypoint_{0U};
+
+  // Ordered execution cursor:
+  //   repetition 0: mission[0] ... mission[N-1]
+  //   repetition 1: mission[0] ... mission[N-1]
+  //   ...
+  uint32_t current_repetition_{0U};
+  std::size_t current_mission_index_{0U};
+  std::size_t current_mission_waypoint_{0U};
+
+  // Snapshot of the unit/base waypoint represented by the in-flight
+  // FollowWaypoints goal.
   std::size_t action_base_index_{0U};
+  std::size_t action_mission_index_{0U};
+  uint32_t action_repetition_{0U};
 
   bool pending_pause_request_{false};
   bool pending_stop_request_{false};

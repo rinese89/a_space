@@ -244,6 +244,12 @@ private:
       }
 
       collision_targets_[trajectory_id] = collision;
+
+      RCLCPP_DEBUG(
+        get_logger(),
+        "Collision target '%s' acquired | missions=%zu",
+        trajectory_id.c_str(),
+        collision.trajectory.mission.size());
     }
 
     collision_snapshot_received_ = true;
@@ -274,6 +280,13 @@ private:
       }
 
       loaded_by_id_[trajectory_id] = loaded;
+
+      RCLCPP_DEBUG(
+        get_logger(),
+        "Net-loaded trajectory '%s' acquired | missions=%zu | net_segments=%zu",
+        trajectory_id.c_str(),
+        loaded.trajectory.mission.size(),
+        loaded.segments.size());
     }
 
     net_snapshot_received_ = true;
@@ -593,7 +606,10 @@ private:
         label.color = make_color(1.0F, 1.0F, 1.0F, 1.0F);
 
         std::ostringstream text;
-        text << trajectory_id << " | edges="
+        text << trajectory_id
+             << " | missions="
+             << detected.trajectory.mission.size()
+             << " edges="
              << detected.collision_segments.size()
              << " nodes="
              << detected.collision_nodes.size();

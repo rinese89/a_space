@@ -325,6 +325,24 @@ def _launch_setup(context, *_args, **_kwargs):
                 0.20,
             )
         ),
+        "takeoff_reach_timeout_s": float(
+            takeoff_cfg.get(
+                "reach_timeout_s",
+                15.0,
+            )
+        ),
+        "takeoff_ground_settle_s": float(
+            takeoff_cfg.get(
+                "ground_settle_s",
+                1.0,
+            )
+        ),
+        "takeoff_max_retries": int(
+            takeoff_cfg.get(
+                "max_retries",
+                0,
+            )
+        ),
     }
 
     common_parameters.update(

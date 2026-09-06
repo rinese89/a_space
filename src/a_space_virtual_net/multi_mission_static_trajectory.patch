@@ -1,0 +1,211 @@
+--- a_space_virtual_net_node_previous.cpp
++++ src/a_space_virtual_net_node.cpp
+@@ -87,12 +87,6 @@
+   }
+ };
+ 
+-struct TaggedPoint
+-{
+-  Vec3 point;
+-  uint8_t phase{SegmentCollision::MISSION};
+-};
+-
+ struct GeometrySegment
+ {
+   Vec3 start;
+@@ -226,62 +220,143 @@
+   return output;
+ }
+ 
+-static void append_tagged_points(
+-  std::vector<TaggedPoint> & target,
+-  const std::vector<Vec3> & source,
+-  uint8_t phase)
+-{
+-  for (const auto & point : source) {
+-    target.push_back(TaggedPoint{point, phase});
+-  }
+-}
+-
+-static uint8_t connection_phase(const TaggedPoint & start, const TaggedPoint & end)
+-{
+-  return start.phase == end.phase ? start.phase : end.phase;
+-}
+-
+-static std::vector<GeometrySegment> build_geometry_segments(const StaticTrajectory & trajectory)
++static void append_polyline_geometry(
++  std::vector<GeometrySegment> & output,
++  const std::vector<Vec3> & points,
++  uint8_t phase,
++  uint32_t & phase_segment_index)
++{
++  if (points.size() < 2U) {
++    return;
++  }
++
++  output.reserve(
++    output.size() +
++    points.size() - 1U);
++
++  for (
++    std::size_t index = 1U;
++    index < points.size();
++    ++index)
++  {
++    output.push_back(
++      GeometrySegment{
++        points[index - 1U],
++        points[index],
++        phase,
++        phase_segment_index++});
++  }
++}
++
++static std::vector<GeometrySegment> build_geometry_segments(
++  const StaticTrajectory & trajectory)
+ {
+   if (trajectory.repetitions == 0U) {
+     throw std::runtime_error(
+-      "Trajectory '" + trajectory.trajectory_id + "': repetitions must be >= 1");
+-  }
+-
+-  const auto takeoff = segment_points(trajectory.takeoff, trajectory.trajectory_id, "takeoff");
+-  const auto mission = segment_points(trajectory.mission, trajectory.trajectory_id, "mission");
+-  const auto landing = segment_points(trajectory.landing, trajectory.trajectory_id, "landing");
+-
+-  std::vector<TaggedPoint> expanded;
+-  expanded.reserve(takeoff.size() + mission.size() * trajectory.repetitions + landing.size());
+-
+-  append_tagged_points(expanded, takeoff, SegmentCollision::TAKEOFF);
+-  for (uint32_t repetition = 0U; repetition < trajectory.repetitions; ++repetition) {
+-    append_tagged_points(expanded, mission, SegmentCollision::MISSION);
+-  }
+-  append_tagged_points(expanded, landing, SegmentCollision::LANDING);
+-
+-  if (expanded.size() < 2U) {
+-    return {};
+-  }
+-
+-  std::array<uint32_t, 3U> phase_indices{0U, 0U, 0U};
++            "Trajectory '" +
++            trajectory.trajectory_id +
++            "': repetitions must be >= 1");
++  }
++
++  const auto takeoff =
++    segment_points(
++      trajectory.takeoff,
++      trajectory.trajectory_id,
++      "takeoff");
++
++  const auto landing =
++    segment_points(
++      trajectory.landing,
++      trajectory.trajectory_id,
++      "landing");
++
++  std::vector<std::vector<Vec3>> missions;
++  missions.reserve(
++    trajectory.mission.size());
++
++  for (
++    std::size_t mission_index = 0U;
++    mission_index < trajectory.mission.size();
++    ++mission_index)
++  {
++    missions.push_back(
++      segment_points(
++        trajectory.mission[mission_index],
++        trajectory.trajectory_id,
++        "mission[" +
++        std::to_string(mission_index) +
++        "]"));
++  }
++
++  std::size_t estimated_segments = 0U;
++
++  if (takeoff.size() >= 2U) {
++    estimated_segments +=
++      takeoff.size() - 1U;
++  }
++
++  for (const auto & mission : missions) {
++    if (mission.size() >= 2U) {
++      estimated_segments +=
++        (mission.size() - 1U) *
++        static_cast<std::size_t>(
++        trajectory.repetitions);
++    }
++  }
++
++  if (landing.size() >= 2U) {
++    estimated_segments +=
++      landing.size() - 1U;
++  }
++
+   std::vector<GeometrySegment> output;
+-  output.reserve(expanded.size() - 1U);
+-
+-  for (std::size_t index = 1U; index < expanded.size(); ++index) {
+-    const uint8_t phase = connection_phase(expanded[index - 1U], expanded[index]);
+-    if (phase > SegmentCollision::LANDING) {
+-      throw std::runtime_error(
+-        "Invalid phase while expanding trajectory '" + trajectory.trajectory_id + "'");
+-    }
+-    const auto slot = static_cast<std::size_t>(phase);
+-    output.push_back(GeometrySegment{
+-      expanded[index - 1U].point,
+-      expanded[index].point,
+-      phase,
+-      phase_indices.at(slot)++});
+-  }
++  output.reserve(
++    estimated_segments);
++
++  uint32_t takeoff_segment_index = 0U;
++  uint32_t mission_segment_index = 0U;
++  uint32_t landing_segment_index = 0U;
++
++  // TAKEOFF is one independent polyline.
++  append_polyline_geometry(
++    output,
++    takeoff,
++    SegmentCollision::TAKEOFF,
++    takeoff_segment_index);
++
++  // Partial repetitions repeat the complete ordered mission collection.
++  //
++  // CRITICAL MULTI-MISSION SEMANTICS:
++  // every mission[i] is an independent continuous polyline.
++  // No geometric segment is inserted between:
++  //
++  //   mission[i].back() -> mission[i + 1].front()
++  //
++  // and no connector is inserted between repetitions either.
++  //
++  // This allows a cropped supervised trajectory to contain multiple
++  // collision-free mission pieces without the virtual net reintroducing the
++  // removed collision section as an artificial lattice route.
++  for (
++    uint32_t repetition = 0U;
++    repetition < trajectory.repetitions;
++    ++repetition)
++  {
++    for (const auto & mission : missions) {
++      append_polyline_geometry(
++        output,
++        mission,
++        SegmentCollision::MISSION,
++        mission_segment_index);
++    }
++  }
++
++  // LANDING is one independent polyline.
++  append_polyline_geometry(
++    output,
++    landing,
++    SegmentCollision::LANDING,
++    landing_segment_index);
+ 
+   return output;
+ }

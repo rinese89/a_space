@@ -33,3 +33,8 @@
     deviation_hold_time_s: 0.75
 
     max_completed_keys: 128
+
+# Multi-mission execution is driven entirely by StaticTrajectory.mission[].
+# No additional parameter is required:
+#   mission[0] -> mission[1] -> ... -> mission[N-1]
+# and that complete collection is repeated `repetitions` times.

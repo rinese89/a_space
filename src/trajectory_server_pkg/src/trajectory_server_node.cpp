@@ -83,12 +83,6 @@ struct Vec3
   double z{0.0};
 };
 
-struct TaggedPoint
-{
-  Vec3 point;
-  Phase phase{Phase::MISSION};
-};
-
 struct GeometrySegment
 {
   Vec3 start;
@@ -141,7 +135,13 @@ struct ActiveTrajectory
 {
   std::string source_key;
   StaticTrajectory trajectory;
+
+  // Completion is accepted only for a sufficiently long ARM -> DISARM cycle.
+  // A short cycle is treated as a failed/retried takeoff and is invalidated,
+  // forcing a new ARM observation before DISARM can complete the trajectory.
   bool armed_seen{false};
+  SteadyTime armed_since{};
+  uint32_t ignored_short_disarms{0U};
 };
 
 static int64_t time_to_ns(const builtin_interfaces::msg::Time & time)
@@ -304,19 +304,32 @@ static std::vector<Vec3> segment_points(
   return points;
 }
 
-static void append_tagged_points(
-  std::vector<TaggedPoint> & target,
-  const std::vector<Vec3> & source,
-  Phase phase)
+static void append_polyline_segments(
+  std::vector<GeometrySegment> & target,
+  const std::vector<Vec3> & points,
+  Phase phase,
+  uint32_t & phase_segment_index)
 {
-  for (const auto & point : source) {
-    target.push_back(TaggedPoint{point, phase});
+  if (points.size() < 2U) {
+    return;
   }
-}
 
-static Phase connection_phase(const TaggedPoint & start, const TaggedPoint & end)
-{
-  return start.phase == end.phase ? start.phase : end.phase;
+  target.reserve(
+    target.size() +
+    points.size() - 1U);
+
+  for (
+    std::size_t index = 1U;
+    index < points.size();
+    ++index)
+  {
+    target.push_back(
+      GeometrySegment{
+        points[index - 1U],
+        points[index],
+        phase,
+        phase_segment_index++});
+  }
 }
 
 static std::vector<GeometrySegment> build_geometry_segments(
@@ -328,46 +341,112 @@ static std::vector<GeometrySegment> build_geometry_segments(
       "Trajectory '" + trajectory.trajectory_id + "': repetitions must be >= 1");
   }
 
-  const auto takeoff = segment_points(
-    trajectory.takeoff, trajectory.trajectory_id, "takeoff", allow_empty_phases);
-  const auto mission = segment_points(
-    trajectory.mission, trajectory.trajectory_id, "mission", allow_empty_phases);
-  const auto landing = segment_points(
-    trajectory.landing, trajectory.trajectory_id, "landing", allow_empty_phases);
+  const auto takeoff =
+    segment_points(
+      trajectory.takeoff,
+      trajectory.trajectory_id,
+      "takeoff",
+      allow_empty_phases);
 
-  std::vector<TaggedPoint> expanded;
-  expanded.reserve(
-    takeoff.size() + mission.size() * trajectory.repetitions + landing.size());
+  const auto landing =
+    segment_points(
+      trajectory.landing,
+      trajectory.trajectory_id,
+      "landing",
+      allow_empty_phases);
 
-  append_tagged_points(expanded, takeoff, Phase::TAKEOFF);
-  for (uint32_t repetition = 0U; repetition < trajectory.repetitions; ++repetition) {
-    append_tagged_points(expanded, mission, Phase::MISSION);
-  }
-  append_tagged_points(expanded, landing, Phase::LANDING);
-
-  if (expanded.size() < 2U) {
-    if (allow_empty_phases) {
-      return {};
-    }
+  if (
+    trajectory.mission.empty() &&
+    !allow_empty_phases)
+  {
     throw std::runtime_error(
-      "Trajectory '" + trajectory.trajectory_id + "': expanded geometry has fewer than 2 points");
+      "Trajectory '" +
+      trajectory.trajectory_id +
+      "': mission array is empty");
   }
 
-  std::array<uint32_t, 3U> phase_indices{0U, 0U, 0U};
+  std::vector<
+    std::vector<Vec3>> missions;
+
+  missions.reserve(
+    trajectory.mission.size());
+
+  for (
+    std::size_t mission_index = 0U;
+    mission_index < trajectory.mission.size();
+    ++mission_index)
+  {
+    missions.push_back(
+      segment_points(
+        trajectory.mission[mission_index],
+        trajectory.trajectory_id,
+        "mission[" +
+        std::to_string(mission_index) +
+        "]",
+        allow_empty_phases));
+  }
+
   std::vector<GeometrySegment> segments;
-  segments.reserve(expanded.size() - 1U);
 
-  for (std::size_t index = 1U; index < expanded.size(); ++index) {
-    const Phase phase = connection_phase(expanded[index - 1U], expanded[index]);
-    const auto slot = static_cast<std::size_t>(phase);
-    const uint32_t phase_index = phase_indices.at(slot)++;
-    segments.push_back(GeometrySegment{
-      expanded[index - 1U].point,
-      expanded[index].point,
-      phase,
-      phase_index});
+  std::size_t geometry_segment_count = 0U;
+
+  if (takeoff.size() >= 2U) {
+    geometry_segment_count +=
+      takeoff.size() - 1U;
   }
 
+  for (const auto & mission : missions) {
+    if (mission.size() >= 2U) {
+      geometry_segment_count +=
+        mission.size() - 1U;
+    }
+  }
+
+  if (landing.size() >= 2U) {
+    geometry_segment_count +=
+      landing.size() - 1U;
+  }
+
+  segments.reserve(
+    geometry_segment_count);
+
+  uint32_t takeoff_segment_index = 0U;
+  uint32_t mission_segment_index = 0U;
+  uint32_t landing_segment_index = 0U;
+
+  // Every TrajectorySegment is an independent continuous polyline.
+  //
+  // In particular, there is NO implicit spatial edge between:
+  //   takeoff.back()        -> mission[0].front()
+  //   mission[i].back()     -> mission[i + 1].front()
+  //   mission.back().back() -> landing.front()
+  //
+  // This is required for supervised crops: separate collision-free mission
+  // pieces must remain spatially disconnected.
+  append_polyline_segments(
+    segments,
+    takeoff,
+    Phase::TAKEOFF,
+    takeoff_segment_index);
+
+  for (const auto & mission : missions) {
+    append_polyline_segments(
+      segments,
+      mission,
+      Phase::MISSION,
+      mission_segment_index);
+  }
+
+  append_polyline_segments(
+    segments,
+    landing,
+    Phase::LANDING,
+    landing_segment_index);
+
+  // Partial repetitions repeat the same mission collection geometrically.
+  // Runtime arbitration only needs unique spatial geometry. Duplicating the
+  // same edges repetitions times would multiply identical collision evidence
+  // without changing the collision decision.
   return segments;
 }
 
@@ -438,25 +517,6 @@ static uint8_t phase_value(Phase phase)
   return static_cast<uint8_t>(phase);
 }
 
-static std::vector<Vec3> marker_points(const StaticTrajectory & trajectory)
-{
-  std::vector<Vec3> output;
-  auto append = [&output](const TrajectorySegment & segment) {
-      const std::size_t size = std::min({segment.x.size(), segment.y.size(), segment.z.size()});
-      for (std::size_t index = 0U; index < size; ++index) {
-        output.push_back(Vec3{segment.x[index], segment.y[index], segment.z[index]});
-      }
-    };
-
-  append(trajectory.takeoff);
-  for (uint32_t repetition = 0U; repetition < std::max<uint32_t>(1U, trajectory.repetitions);
-    ++repetition)
-  {
-    append(trajectory.mission);
-  }
-  append(trajectory.landing);
-  return output;
-}
 
 static std_msgs::msg::ColorRGBA color_from_trajectory_id(const std::string & trajectory_id)
 {
@@ -527,6 +587,16 @@ public:
     vehicle_status_timeout_s_ = declare_parameter<double>(
       "vehicle_status_timeout_s", 2.0);
 
+    // A DISARM shortly after ARM may correspond to a failed takeoff followed
+    // by PX4 auto-disarm/failsafe recovery. Such a DISARM must not remove the
+    // active trajectory because the UAS will retry the same occurrence.
+    //
+    // Set to 0.0 to recover the legacy "first ARM -> DISARM completes" behavior.
+    minimum_armed_duration_for_completion_s_ =
+      declare_parameter<double>(
+      "minimum_armed_duration_for_completion_s",
+      20.0);
+
     spatial_conflict_distance_m_ = declare_parameter<double>(
       "spatial_conflict_distance_m", 1.0);
     use_3d_ = declare_parameter<bool>("use_3d", true);
@@ -587,7 +657,8 @@ public:
       "Trajectory server ready | input='%s' | supervised='%s' | active='%s' | "
       "non_priority_adjustment='%s' | registration_service='%s' | "
       "store=T-%.1fs | publish=T-%.1fs | "
-      "reschedule margin=%.1fs | vehicle_status='%s' | spatial threshold=%.3fm | "
+      "reschedule margin=%.1fs | vehicle_status='%s' | "
+      "min_ARM_duration_for_completion=%.1fs | spatial threshold=%.3fm | "
       "use_3d=%s | extra_time calculation=disabled",
       available_topic_.c_str(),
       supervised_topic_.c_str(),
@@ -598,6 +669,7 @@ public:
       publication_lead_time_s_,
       reschedule_margin_s_,
       vehicle_status_suffix_.c_str(),
+      minimum_armed_duration_for_completion_s_,
       spatial_conflict_distance_m_,
       use_3d_ ? "true" : "false");
   }
@@ -634,6 +706,13 @@ private:
     }
     if (!std::isfinite(vehicle_status_timeout_s_) || vehicle_status_timeout_s_ <= 0.0) {
       throw std::runtime_error("vehicle_status_timeout_s must be finite and > 0");
+    }
+    if (
+      !std::isfinite(minimum_armed_duration_for_completion_s_) ||
+      minimum_armed_duration_for_completion_s_ < 0.0)
+    {
+      throw std::runtime_error(
+              "minimum_armed_duration_for_completion_s must be finite and >= 0");
     }
     if (!std::isfinite(spatial_conflict_distance_m_) || spatial_conflict_distance_m_ < 0.0) {
       throw std::runtime_error("spatial_conflict_distance_m must be finite and >= 0");
@@ -687,6 +766,25 @@ private:
     return true;
   }
 
+  static bool mission_coordinates_valid(
+    const std::vector<TrajectorySegment> & missions,
+    bool allow_empty_phase)
+  {
+    if (missions.empty()) {
+      return allow_empty_phase;
+    }
+
+    for (const auto & mission : missions) {
+      // An empty mission component has no useful semantics. A fully removed
+      // MISSION phase is represented by an empty mission array instead.
+      if (!segment_coordinates_valid(mission, false)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   bool is_supervised_id_locked(const std::string & trajectory_id) const
   {
     return latest_supervised_.find(trajectory_id) != latest_supervised_.end();
@@ -700,13 +798,16 @@ private:
       return false;
     }
 
-    // Normal trajectories keep the original strict requirement: every phase
-    // must contain geometry. A supervised trajectory is special because its
-    // AVAILABLE copy is the deliberately cropped version and TAKEOFF, MISSION
-    // or LANDING may therefore be empty.
+    // Normal trajectories keep the strict requirement: TAKEOFF, at least one
+    // MISSION component and LANDING must contain valid geometry.
+    //
+    // A supervised trajectory is special because its AVAILABLE copy is the
+    // deliberately cropped version. TAKEOFF or LANDING may be empty and the
+    // complete MISSION phase may be represented by an empty mission array.
+    // If mission components are present, each component must itself be valid.
     return
       segment_coordinates_valid(trajectory.takeoff, supervised) &&
-      segment_coordinates_valid(trajectory.mission, supervised) &&
+      mission_coordinates_valid(trajectory.mission, supervised) &&
       segment_coordinates_valid(trajectory.landing, supervised);
   }
 
@@ -925,45 +1026,123 @@ private:
 
   void mark_active_completions_locked(int64_t current_ns)
   {
+    const SteadyTime steady_now =
+      std::chrono::steady_clock::now();
+
     for (auto it = active_.begin(); it != active_.end();) {
       auto & state = it->second;
       ensure_vehicle_status_watcher_locked(state.trajectory);
 
       bool armed = false;
-      const bool fresh = fresh_armed_state_locked(state.trajectory, armed);
+      const bool fresh =
+        fresh_armed_state_locked(
+        state.trajectory,
+        armed);
+
+      // --------------------------------------------------------------
+      // ARM observation
+      // --------------------------------------------------------------
+      // Start the minimum-duration timer only when a NEW arm cycle is seen.
+      // Repeated ARMED samples during the same cycle do not reset it.
       if (fresh && armed) {
-        state.armed_seen = true;
+        if (!state.armed_seen) {
+          state.armed_seen = true;
+          state.armed_since = steady_now;
+
+          RCLCPP_INFO(
+            get_logger(),
+            "Active trajectory '%s': ARM observed; completion DISARM will be "
+            "accepted after at least %.1f s of this arm cycle",
+            state.trajectory.trajectory_id.c_str(),
+            minimum_armed_duration_for_completion_s_);
+        }
+
         ++it;
         continue;
       }
 
       // Initial DISARMED samples before the operation actually arms are not a
-      // completion event. The trajectory remains active until an ARM -> DISARM
-      // transition has been observed.
+      // completion event. Likewise, after a short failed ARM -> DISARM cycle,
+      // armed_seen is cleared and the server waits for the retry's NEW ARM.
       if (!(fresh && !armed && state.armed_seen)) {
         ++it;
         continue;
       }
 
-      const std::string completed_key = it->first;
-      const std::string completed_id = state.trajectory.trajectory_id;
-      completed_source_keys_.insert(state.source_key);
+      // --------------------------------------------------------------
+      // DISARM after a previously observed ARM
+      // --------------------------------------------------------------
+      const double armed_duration_s =
+        std::chrono::duration<double>(
+        steady_now -
+        state.armed_since).count();
+
+      if (
+        armed_duration_s <
+        minimum_armed_duration_for_completion_s_)
+      {
+        ++state.ignored_short_disarms;
+
+        RCLCPP_WARN(
+          get_logger(),
+          "Active trajectory '%s': ignoring DISARMED after only %.3f s ARMED "
+          "(minimum %.3f s) | interpreted as failed/retried takeoff | "
+          "ignored_short_disarms=%u | waiting for a NEW ARM cycle",
+          state.trajectory.trajectory_id.c_str(),
+          armed_duration_s,
+          minimum_armed_duration_for_completion_s_,
+          state.ignored_short_disarms);
+
+        // CRITICAL: invalidate this arm cycle. Otherwise a UAS remaining
+        // DISARMED on the ground could eventually be mistaken for completion
+        // once wall-clock time exceeds the threshold. The retry must produce a
+        // NEW ARMED observation, which starts a fresh timer.
+        state.armed_seen = false;
+        state.armed_since = SteadyTime{};
+
+        ++it;
+        continue;
+      }
+
+      // This is the first DISARM belonging to an arm cycle long enough to be
+      // interpreted as the real end of the operation.
+      const std::string completed_key =
+        it->first;
+      const std::string completed_id =
+        state.trajectory.trajectory_id;
+
+      completed_source_keys_.insert(
+        state.source_key);
 
       for (auto & [_, pending] : pending_) {
-        const auto blocker = pending.blocker_active_keys.find(completed_key);
-        if (blocker == pending.blocker_active_keys.end()) {
+        const auto blocker =
+          pending.blocker_active_keys.find(
+          completed_key);
+
+        if (
+          blocker ==
+          pending.blocker_active_keys.end())
+        {
           continue;
         }
-        pending.blocker_active_keys.erase(blocker);
-        pending.latest_blocker_completion_ns = std::max(
+
+        pending.blocker_active_keys.erase(
+          blocker);
+
+        pending.latest_blocker_completion_ns =
+          std::max(
           pending.latest_blocker_completion_ns,
           current_ns);
       }
 
       RCLCPP_INFO(
         get_logger(),
-        "Active trajectory '%s' completed: UAS DISARMED observed",
-        completed_id.c_str());
+        "Active trajectory '%s' completed: DISARMED observed after %.3f s "
+        "of the latest ARM cycle (minimum %.3f s) | ignored_short_disarms=%u",
+        completed_id.c_str(),
+        armed_duration_s,
+        minimum_armed_duration_for_completion_s_,
+        state.ignored_short_disarms);
 
       it = active_.erase(it);
     }
@@ -1078,7 +1257,11 @@ private:
 
     bool armed = false;
     if (fresh_armed_state_locked(active.trajectory, armed) && armed) {
+      // If the trajectory becomes ACTIVE while VehicleStatus is already ARMED,
+      // conservatively start the minimum-duration clock now. We cannot infer
+      // an earlier ARM transition from a single retained/current status sample.
       active.armed_seen = true;
+      active.armed_since = std::chrono::steady_clock::now();
     }
 
     active_[source_key] = std::move(active);
@@ -1354,49 +1537,106 @@ private:
     const rclcpp::Time & stamp,
     MarkerArray & marker_array) const
   {
-    const auto points = marker_points(trajectory);
-    if (points.empty()) {
+    const bool supervised =
+      is_supervised_id_locked(
+      trajectory.trajectory_id);
+
+    std::vector<GeometrySegment> geometry;
+
+    try {
+      geometry =
+        build_geometry_segments(
+        trajectory,
+        supervised);
+    } catch (const std::exception & error) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Could not create ACTIVE marker for '%s': %s",
+        trajectory.trajectory_id.c_str(),
+        error.what());
+
       return;
     }
 
-    const auto color = color_from_trajectory_id(trajectory.trajectory_id);
-    const std::string frame_id = trajectory.frame_id.empty() ? "map" : trajectory.frame_id;
-    const std::string ns = "active_trajectory/" + trajectory.trajectory_id;
+    if (geometry.empty()) {
+      return;
+    }
 
+    const auto marker_color =
+      color_from_trajectory_id(
+      trajectory.trajectory_id);
+
+    const std::string frame_id =
+      trajectory.frame_id.empty() ?
+      "map" :
+      trajectory.frame_id;
+
+    const std::string marker_namespace =
+      "active_trajectory/" +
+      trajectory.trajectory_id;
+
+    // LINE_LIST is deliberate. A LINE_STRIP would reconnect separate mission
+    // components and visually invent geometry across cropped gaps.
     Marker line;
     line.header.frame_id = frame_id;
     line.header.stamp = stamp;
-    line.ns = ns;
+    line.ns = marker_namespace;
     line.id = 0;
-    line.type = Marker::LINE_STRIP;
+    line.type = Marker::LINE_LIST;
     line.action = Marker::ADD;
     line.pose.orientation.w = 1.0;
     line.scale.x = marker_line_width_;
-    line.color = color;
-    for (const auto & point : points) {
-      line.points.push_back(to_point(point));
+    line.color = marker_color;
+
+    for (const auto & segment : geometry) {
+      line.points.push_back(
+        to_point(segment.start));
+      line.points.push_back(
+        to_point(segment.end));
     }
-    marker_array.markers.push_back(std::move(line));
+
+    marker_array.markers.push_back(
+      std::move(line));
 
     Marker text;
     text.header.frame_id = frame_id;
     text.header.stamp = stamp;
-    text.ns = ns;
+    text.ns = marker_namespace;
     text.id = 1;
     text.type = Marker::TEXT_VIEW_FACING;
     text.action = Marker::ADD;
     text.pose.orientation.w = 1.0;
-    text.pose.position = to_point(points.front());
-    text.pose.position.z += marker_text_height_ * 1.8;
-    text.scale.z = marker_text_height_;
-    text.color = color;
+    text.pose.position =
+      to_point(
+      geometry.front().start);
+    text.pose.position.z +=
+      marker_text_height_ * 1.8;
+    text.scale.z =
+      marker_text_height_;
+    text.color =
+      marker_color;
 
     std::ostringstream label;
-    label << "ACTIVE " << trajectory.trajectory_id << " | P=" << trajectory.priority << "\n"
-          << "start: " << format_utc_iso8601(trajectory.operation_start_utc) << "\n"
-          << "end:   " << format_utc_iso8601(trajectory.operation_end_utc);
+    label
+      << "ACTIVE "
+      << trajectory.trajectory_id
+      << " | P="
+      << trajectory.priority
+      << " | M="
+      << trajectory.mission.size()
+      << "\n"
+      << "start: "
+      << format_utc_iso8601(
+      trajectory.operation_start_utc)
+      << "\n"
+      << "end:   "
+      << format_utc_iso8601(
+      trajectory.operation_end_utc);
+
     text.text = label.str();
-    marker_array.markers.push_back(std::move(text));
+
+    marker_array.markers.push_back(
+      std::move(text));
   }
 
   void publish_active_snapshot_locked(
@@ -1502,6 +1742,7 @@ private:
 
   std::string vehicle_status_suffix_{"fmu/out/vehicle_status"};
   double vehicle_status_timeout_s_{2.0};
+  double minimum_armed_duration_for_completion_s_{20.0};
 
   double spatial_conflict_distance_m_{1.0};
   bool use_3d_{true};

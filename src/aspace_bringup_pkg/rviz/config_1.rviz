@@ -18,12 +18,9 @@ Panels:
         - /MarkerArray6
         - /MarkerArray7
         - /MarkerArray8
+        - /MarkerArray8/Namespaces1
         - /MarkerArray9
-        - /MarkerArray10
-        - /MarkerArray11
-        - /MarkerArray11/Namespaces1
-        - /MarkerArray12
-      Splitter Ratio: 0.6213114857673645
+      Splitter Ratio: 0.6582914590835571
     Tree Height: 719
   - Class: rviz_common/Selection
     Name: Selection
@@ -105,13 +102,75 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        inspection_1/ua_ins_1/arm_x_visual:
+          Value: true
+        inspection_1/ua_ins_1/base_link:
+          Value: true
+        inspection_1/ua_ins_1/camera_link:
+          Value: true
+        inspection_1/ua_ins_1/odom:
+          Value: true
+        inspection_1/ua_ins_1/rotor_1_link:
+          Value: true
+        inspection_1/ua_ins_1/rotor_2_link:
+          Value: true
+        inspection_1/ua_ins_1/rotor_3_link:
+          Value: true
+        inspection_1/ua_ins_1/rotor_4_link:
+          Value: true
+        inspection_1/ua_ins_2/arm_x_visual:
+          Value: true
+        inspection_1/ua_ins_2/base_link:
+          Value: true
+        inspection_1/ua_ins_2/camera_link:
+          Value: true
+        inspection_1/ua_ins_2/odom:
+          Value: true
+        inspection_1/ua_ins_2/rotor_1_link:
+          Value: true
+        inspection_1/ua_ins_2/rotor_2_link:
+          Value: true
+        inspection_1/ua_ins_2/rotor_3_link:
+          Value: true
+        inspection_1/ua_ins_2/rotor_4_link:
+          Value: true
+        map:
+          Value: true
       Marker Scale: 1
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
       Tree:
-        {}
+        map:
+          inspection_1/ua_ins_1/odom:
+            inspection_1/ua_ins_1/base_link:
+              inspection_1/ua_ins_1/arm_x_visual:
+                {}
+              inspection_1/ua_ins_1/camera_link:
+                {}
+              inspection_1/ua_ins_1/rotor_1_link:
+                {}
+              inspection_1/ua_ins_1/rotor_2_link:
+                {}
+              inspection_1/ua_ins_1/rotor_3_link:
+                {}
+              inspection_1/ua_ins_1/rotor_4_link:
+                {}
+          inspection_1/ua_ins_2/odom:
+            inspection_1/ua_ins_2/base_link:
+              inspection_1/ua_ins_2/arm_x_visual:
+                {}
+              inspection_1/ua_ins_2/camera_link:
+                {}
+              inspection_1/ua_ins_2/rotor_1_link:
+                {}
+              inspection_1/ua_ins_2/rotor_2_link:
+                {}
+              inspection_1/ua_ins_2/rotor_3_link:
+                {}
+              inspection_1/ua_ins_2/rotor_4_link:
+                {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/MarkerArray
@@ -153,17 +212,18 @@ Visualization Manager:
         Value: /requested_static_trajectories_markers
       Value: false
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
+      Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        AVAILABLE/inspection_ua_ins_1: true
+        AVAILABLE/inspection_ua_ins_2: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /available_static_trajectories_markers
-      Value: false
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
       Name: MarkerArray
@@ -177,30 +237,6 @@ Visualization Manager:
         Value: /collision_static_trajectories_markers
       Value: false
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: MarkerArray
-      Namespaces:
-        {}
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /inspection_1/ua_ins_1/zone_status/markers
-      Value: false
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: MarkerArray
-      Namespaces:
-        {}
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /inspection_1/ua_ins_2/zone_status/markers
-      Value: false
-    - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: MarkerArray
       Namespaces:
@@ -212,18 +248,6 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /active_trajectories_markers
       Value: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
-      Name: MarkerArray
-      Namespaces:
-        {}
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /collision_trajectories/inspection_1/intersection_mission_markers
-      Value: false
     - Class: rviz_default_plugins/MarkerArray
       Enabled: false
       Name: MarkerArray
@@ -252,7 +276,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        supervision/collision_nodes/inspection_ua_ins_2: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -260,6 +284,30 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /supervision_trajectory_manager_markers
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /inspection_1/ua_ins_1/zone_status/markers
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /inspection_1/ua_ins_2/zone_status/markers
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -306,7 +354,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/XYOrbit
-      Distance: 25.029699325561523
+      Distance: 20.489652633666992
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -321,10 +369,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.46979784965515137
+      Pitch: 0.5247979760169983
       Target Frame: drone_base
       Value: XYOrbit (rviz_default_plugins)
-      Yaw: 4.304225444793701
+      Yaw: 4.024220943450928
     Saved: ~
 Window Geometry:
   Displays:

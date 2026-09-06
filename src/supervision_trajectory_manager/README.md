@@ -1,219 +1,213 @@
-# supervision_trajectory_manager 0.4.1
+# supervision_trajectory_manager 0.5.0
 
-This revision adapts `supervision_trajectory_manager_node` to the new
-`deconfliction_manager` supervision-request message.
+Adapted to the new multi-mission `StaticTrajectory` and to the new
+`deconfliction_manager/CroppedNetTrajectory` contract.
 
-## Input change
+## Architectural change
 
-Old input:
-
-```text
-/requested_supervision_trajectories
-collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-New input:
+The crop is now fully materialized upstream by `deconfliction_manager_node`:
 
 ```text
 /requested_supervision_trajectories
-deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
+  RequestedSupervisionTrajectory
+    detected_collision
+      -> ORIGINAL DetectedCollisionTrajectory
+
+    cropped_trajectory
+      complete
+      trajectory_materialized
+      trajectory
+        -> READY-TO-USE cropped StaticTrajectory
+           with TrajectorySegment[] mission
 ```
 
-Each request already contains:
+This node no longer performs any geometric crop/materialization.
+
+Removed responsibilities include:
 
 ```text
-detected_collision
-  -> ORIGINAL DetectedCollisionTrajectory
-
-cropped_trajectory
-  -> virtual-net crop calculated by deconfliction_manager_node
+phase_segments()
+split_runs()
+materialize_run()
+materialize_phase_exact()
+materialize_adjusted()
+point-to-polyline orientation logic
 ```
 
-This node no longer decides which collision nodes/segments must be removed and
-no longer maps collision nodes back to sparse original waypoints.
+## Exact acquisition rule
 
-## Responsibilities
-
-The node now performs only:
+A request can be injected into `/adjusted_trajectories` only when:
 
 ```text
-1. Acquire detected_collision + cropped_trajectory.
-2. Materialize the already-cropped virtual-net geometry into the legacy
-   StaticTrajectory representation required by /adjusted_trajectories.
-3. Publish the adjusted StaticTrajectory while PENDING.
-4. Confirm that exact geometry in /available_static_trajectories.
-5. Publish the ORIGINAL DetectedCollisionTrajectory on /supervised_trajectories.
-6. Synchronize periodic operation_start_utc / operation_end_utc from AVAILABLE.
-```
-
-## Important representation constraint
-
-`CroppedNetTrajectory` can preserve multiple disconnected retained pieces in one
-phase.
-
-`static_trajectory_manager/msg/TrajectorySegment` cannot. It is one continuous
-x/y/z polyline.
-
-The previous implementation selected the longest continuous retained run of
-each phase. That was incorrect because it changed the crop received from
-`deconfliction_manager_node`.
-
-This version performs an **exact-only** conversion:
-
-```text
-0 retained runs in phase -> empty phase
-1 retained run           -> exact TrajectorySegment
-2+ retained runs         -> NOT representable as StaticTrajectory
-```
-
-Two retained net edges are considered contiguous only when:
-
-```text
-they share a node
+cropped_trajectory.complete == true
 AND
-next.net_segment_index == previous.net_segment_index + 1
+cropped_trajectory.trajectory_materialized == true
 ```
 
-The node never discards a fragment and never reconnects a gap. If the exact
-upstream crop is disconnected inside one phase, it is kept internally and
-displayed in RViz, but nothing is published to `/adjusted_trajectories` for
-that entry because the current `StaticTrajectory` schema cannot encode it
-without changing the geometry.
+When both are true:
 
-This is a representation/materialization step, not a new crop decision. The
-upstream `deconfliction_manager_node` remains the only node that decides which
-virtual-net nodes and edges are removed.
+```cpp
+entry.adjusted = cropped_trajectory.trajectory;
+```
 
-The exact complete upstream crop is retained internally and shown in RViz as a
-`LINE_LIST`.
+No waypoint, edge, mission component or ordering is changed locally.
 
-## Incomplete crop handling
+## Multi-mission preservation
 
-If:
+If the upstream crop contains:
 
 ```text
-cropped_trajectory.complete == false
+mission[0]: A -> B
+mission[1]: E -> F
+mission[2]: K -> L -> M
 ```
 
-the request is stored but is not sent to `/adjusted_trajectories`.
+`/adjusted_trajectories` contains those same three mission components in the
+same order.
 
-The node waits for the authoritative transient-local request to be republished
-with:
+There is no local run selection and no artificial connection between them.
+
+## TAKEOFF/LANDING materialization failure
+
+`deconfliction_manager_node` may produce:
 
 ```text
-complete == true
+complete = true
+trajectory_materialized = false
 ```
 
-An older incomplete snapshot cannot overwrite a complete crop that has already
-been acquired.
+when TAKEOFF or LANDING is split into more than one disconnected retained run,
+because those phases are still represented by one `TrajectorySegment` each.
 
-## Persistent lifecycle
+In that case this node stores the exact crop for diagnostics but does not
+publish a false `StaticTrajectory` to `/adjusted_trajectories`.
 
-Requests are not deleted merely because they disappear from
-`/requested_supervision_trajectories`.
+## AVAILABLE confirmation
 
-That disappearance is expected after the adjusted trajectory enters the
-available flow and is no longer detected as an upstream collision.
-
-Lifecycle:
+The state flow remains:
 
 ```text
-new complete request
-    -> PENDING
-    -> /adjusted_trajectories
-
-expected adjusted geometry appears in AVAILABLE
-    -> SUPERVISED
-    -> /supervised_trajectories
-
-expected adjusted geometry disappears from AVAILABLE
-    -> PENDING
-    -> /adjusted_trajectories again
+complete + materialized request
+        -> PENDING
+        -> /adjusted_trajectories
+        -> static_trajectory_manager
+        -> /available_static_trajectories
+        -> exact multi-mission geometry match
+        -> SUPERVISED
 ```
+
+`same_geometry()` now compares:
+
+```text
+trajectory_id
+frame_id
+repetitions
+takeoff
+mission.size()
+mission[0]
+mission[1]
+...
+landing
+```
+
+Mission order is significant.
+
+Operation timestamps are intentionally not part of the geometry comparison.
 
 ## `/supervised_trajectories`
 
-The output type remains:
+The output remains:
 
 ```text
 collision_detection/msg/DetectedCollisionTrajectoryArray
 ```
 
-The published object is the ORIGINAL complete `detected_collision` payload.
+and publishes the ORIGINAL complete collision payload, including the ORIGINAL
+multi-mission trajectory.
 
-The virtual-net crop is not substituted into this output.
+The cropped trajectory is used only for the AVAILABLE reservation path.
 
 ## Periodic trajectories
 
-For:
-
-```text
-operation_frequency > 0
-```
-
-once the adjusted geometry is found in `/available_static_trajectories`, only:
+For `operation_frequency > 0`, once the cropped trajectory is observed in
+AVAILABLE, the current:
 
 ```text
 operation_start_utc
 operation_end_utc
 ```
 
-are copied from the AVAILABLE cropped occurrence.
+are copied to the ORIGINAL trajectory published on `/supervised_trajectories`.
 
-Those updated times are applied to the ORIGINAL trajectory published on
-`/supervised_trajectories` and to the stored adjusted copy used for reinjection.
+The stored adjusted copy also receives those timestamps so a later requeue uses
+the current occurrence rather than the original occurrence.
 
-This preserves the previously implemented total-period progression.
+## Persistent lifecycle
 
-## QoS
+Entries are not deleted merely because they disappear from
+`/requested_supervision_trajectories`.
 
-All trajectory subscriptions/publications use:
+That disappearance is expected once the adjusted trajectory enters AVAILABLE
+and no longer appears as an upstream collision.
+
+## Markers
+
+Pending markers continue to show the exact retained virtual-net crop as a
+`LINE_LIST`.
+
+With the new interface each retained item is a `CroppedNetSegment`, so marker
+geometry is read from:
 
 ```text
-RELIABLE
-TRANSIENT_LOCAL
-KeepLast(1)
+cropped_segment.segment.start
+cropped_segment.segment.end
 ```
 
-The node also republishes every second by default.
+No visual bridge is generated between mission fragments.
 
-## Build order
+## Build
 
-`supervision_trajectory_manager` now depends on `deconfliction_manager` because
-the latter owns `RequestedSupervisionTrajectoryArray`.
+Because both `StaticTrajectory` and the deconfliction messages changed, rebuild
+the dependency chain cleanly:
 
 ```bash
 cd ~/a_space_ws
 
-rm -rf build/supervision_trajectory_manager
-rm -rf install/supervision_trajectory_manager
+rm -rf build/static_trajectory_manager \\
+       build/a_space_virtual_net \\
+       build/collision_detection \\
+       build/deconfliction_manager \\
+       build/supervision_trajectory_manager
 
-colcon build --symlink-install \
+rm -rf install/static_trajectory_manager \\
+       install/a_space_virtual_net \\
+       install/collision_detection \\
+       install/deconfliction_manager \\
+       install/supervision_trajectory_manager
+
+colcon build --symlink-install \\
   --packages-up-to supervision_trajectory_manager
 
 source install/setup.bash
 ```
 
-## Check
+## Runtime check
 
 ```bash
-ros2 topic info /requested_supervision_trajectories
+ros2 topic echo /requested_supervision_trajectories
+ros2 topic echo /adjusted_trajectories
 ```
 
-Expected:
+For a request with `trajectory_materialized: true`, compare:
 
 ```text
-Type: deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
+requested.trajectories[i].cropped_trajectory.trajectory.mission
 ```
 
-The downstream output remains:
-
-```bash
-ros2 topic info /supervised_trajectories
-```
-
-Expected:
+against:
 
 ```text
-Type: collision_detection/msg/DetectedCollisionTrajectoryArray
+adjusted.trajectories[j].mission
 ```
+
+They must be identical except for later periodic start/end synchronization.

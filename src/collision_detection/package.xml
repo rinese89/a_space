@@ -1,12 +1,12 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>collision_detection</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
 
   <description>
-    Second-stage A-space collision detector. Uses the retained collision
-    trajectory snapshot and the virtual-net discretization to identify exact
-    shared lattice nodes and edges with other loaded trajectories.
+    Second-stage A-space collision detector adapted to multi-mission static
+    trajectories. Uses retained collision targets and virtual-net
+    discretization to identify exact shared lattice nodes and edges.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>

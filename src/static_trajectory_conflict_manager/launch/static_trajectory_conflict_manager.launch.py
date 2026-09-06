@@ -1,34 +1,30 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
-
-import os
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    package_share = get_package_share_directory(
-        'static_trajectory_conflict_manager')
+    default_config = PathJoinSubstitution([
+        FindPackageShare("static_trajectory_conflict_manager"),
+        "config",
+        "static_trajectory_conflict_manager.yaml",
+    ])
 
-    default_config = os.path.join(
-        package_share,
-        'config',
-        'static_trajectory_conflict_manager.yaml')
-
-    config_file = LaunchConfiguration('config_file')
+    config_file = LaunchConfiguration("config_file")
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'config_file',
+            "config_file",
             default_value=default_config,
-            description='Path to static trajectory conflict manager YAML',
+            description="Path to static trajectory conflict-manager YAML",
         ),
         Node(
-            package='static_trajectory_conflict_manager',
-            executable='static_trajectory_conflict_manager_node',
-            name='static_trajectory_conflict_manager_node',
-            output='screen',
+            package="static_trajectory_conflict_manager",
+            executable="static_trajectory_conflict_manager_node",
+            name="static_trajectory_conflict_manager_node",
+            output="screen",
             parameters=[config_file],
         ),
     ])

@@ -1,83 +1,201 @@
-# a_space_virtual_net
+# a_space_virtual_net 0.4.0
 
 ROS 2 Humble package implementing the persistent Cartesian virtual net of the
-A-space.
+A-space, adapted to the new multi-mission `StaticTrajectory` interface.
 
-## New role
+## StaticTrajectory change
 
-This revision removes the old `/a_space_virtual_net/free_routes` output.
-Instead, every upstream static trajectory is projected onto the lattice and
-published already segmented by virtual-net edges.
+Upstream now publishes:
+
+```text
+TrajectorySegment takeoff
+TrajectorySegment[] mission
+TrajectorySegment landing
+```
+
+instead of one single `mission` segment.
 
 ## Inputs
 
 ```text
 /available_static_trajectories
+  static_trajectory_manager/msg/StaticTrajectoryArray
+
 /collision_static_trajectories
+  static_trajectory_conflict_manager/msg/CollisionStaticTrajectoryArray
 ```
 
-The node no longer subscribes to `/flight_zones`.
+Both inputs remain authoritative retained snapshots.
 
 ## Main output
 
 ```text
 /net_loaded_trajectories
-```
-
-Type:
-
-```text
 a_space_virtual_net/msg/NetLoadedTrajectoryArray
 ```
 
-The output is a `RELIABLE + TRANSIENT_LOCAL + KeepLast(1)` authoritative
-snapshot and is also republished every second by default.
-
-## Projection
-
-The complete operation is expanded as:
+The output remains:
 
 ```text
-TAKEOFF -> MISSION x repetitions -> LANDING
+RELIABLE
+TRANSIENT_LOCAL
+KeepLast(1)
 ```
 
-Every original finite segment is clipped to the configured grid volume,
-its endpoints are snapped to the nearest lattice nodes and it is represented
-as a deterministic sequence of adjacent X/Y/Z edges.
+and is also republished periodically.
 
-Therefore `/net_loaded_trajectories` contains the route actually loaded on the
-virtual net, not merely the original continuous waypoints.
+## Multi-mission projection
 
-## NetTrajectorySegment
-
-Every discretized edge publishes:
+A complete operation is now interpreted as:
 
 ```text
-edge_id
-axis
+TAKEOFF
+
+repetition 0:
+  mission[0]
+  mission[1]
+  ...
+  mission[N-1]
+
+repetition 1:
+  mission[0]
+  mission[1]
+  ...
+  mission[N-1]
+
+...
+
+LANDING
+```
+
+However, each `mission[i]` is an **independent continuous polyline**.
+
+The virtual net projects only edges that exist inside each component.
+
+It never creates a connector between:
+
+```text
+takeoff.back()        -> mission[0].front()
+mission[i].back()     -> mission[i+1].front()
+mission[N-1].back()   -> mission[0].front() of the next repetition
+mission.back().back() -> landing.front()
+```
+
+### Example
+
+Input:
+
+```text
+mission[0]:
+(3,3) -> (3,4)
+
+mission[1]:
+(3,9) -> (3,10)
+```
+
+The projected net contains only the lattice routes corresponding to:
+
+```text
+(3,3) -> (3,4)
+
+(3,9) -> (3,10)
+```
+
+It never recreates:
+
+```text
+(3,4) -> ... -> (3,9)
+```
+
+This is essential for supervised cropped trajectories.
+
+## Partial repetitions
+
+Unlike the static conflict manager and runtime server, this node deliberately
+keeps the temporal expansion produced by:
+
+```text
+repetitions
+```
+
+because `/net_loaded_trajectories` represents every traversal loaded onto the
+virtual net.
+
+Therefore, if:
+
+```yaml
+repetitions: 3
+```
+
+the mission collection is projected three times.
+
+The downstream `deconfliction_manager_node` is responsible for collapsing
+repeated collision geometry when it counts unique `node_id` values.
+
+## Geometry discretization
+
+Every internal continuous source edge is:
+
+1. clipped against the configured virtual-net volume;
+2. snapped to its nearest lattice nodes;
+3. converted to a deterministic adjacent X/Y/Z lattice path;
+4. published as one or more `NetTrajectorySegment` messages.
+
+The virtual-net discretization itself is unchanged.
+
+## `original_phase_segment_index`
+
+The existing message interface is retained.
+
+For MISSION, the index is now global and monotonically increasing across all
+mission components and repetitions.
+
+Example:
+
+```text
+mission[0] has 2 source edges
+mission[1] has 3 source edges
+repetitions = 2
+```
+
+The MISSION source indices become:
+
+```text
+repetition 0
+  mission[0] -> 0,1
+  mission[1] -> 2,3,4
+
+repetition 1
+  mission[0] -> 5,6
+  mission[1] -> 7,8,9
+```
+
+These consecutive numbers are identifiers only.
+
+There is **no implied geometric connection** between index `1` and `2`, or
+between `4` and `5`.
+
+Connectivity is defined by:
+
+```text
 start_node_id
 end_node_id
-start
-end
-length_m
-phase
-original_phase_segment_index
-net_segment_index
 ```
 
-The pair:
+## `net_segment_index`
 
-```text
-phase + original_phase_segment_index
-```
+`net_segment_index` remains the order of emitted lattice edges in the complete
+projection stream.
 
-links every grid edge back to the corresponding segment of the expanded
-original trajectory. `net_segment_index` is the order inside the complete
-projected route.
+Again, consecutive values do not imply continuity. Consumers must use node IDs
+when they need to reconstruct continuous runs.
+
+This is already compatible with the supervision crop logic, which checks both
+ordering and node connectivity.
 
 ## NetLoadedTrajectory
 
-Each trajectory contains:
+Each output item still contains:
 
 ```text
 source_state
@@ -85,40 +203,15 @@ trajectory
 segments[]
 ```
 
-`source_state` is one of:
+The complete new multi-mission `StaticTrajectory` is preserved in
+`trajectory`.
 
-```text
-AVAILABLE
-COLLISION
-```
+## Edge occupancy
 
-The original `StaticTrajectory` is preserved together with its lattice
-projection.
+Available and collision trajectories are registered on the same persistent
+virtual-net edges as before.
 
-If an inconsistent upstream state contains the same `trajectory_id` in both
-input topics, `COLLISION` wins.
-
-## Node IDs
-
-For grid index `(x,y,z)`:
-
-```text
-node_id = z * nodes_y * nodes_x + y * nodes_x + x
-```
-
-For a fixed origin, dimensions and `density_net`, IDs are deterministic.
-
-## Virtual-net state
-
-The previous structured state remains available on:
-
-```text
-/a_space_virtual_net/state
-```
-
-It tracks occupancy and capacity of every edge.
-
-With the new simplified conflict manager, effective edge states are:
+Effective edge states remain:
 
 ```text
 FREE
@@ -126,48 +219,42 @@ AVAILABLE
 COLLISION
 ```
 
-`COLLISION_CLEAR` remains in the message only for source compatibility.
+Collision state wins when an inconsistent upstream snapshot contains the same
+trajectory ID in both AVAILABLE and COLLISION.
 
-## RViz markers
+## RViz
 
-Published on:
+The existing trajectory markers already use:
 
 ```text
-/a_space_virtual_net/markers
+Marker::LINE_LIST
 ```
 
-There are only two conceptual marker classes:
+and are built directly from `NetTrajectorySegment[]`.
 
-1. Free net edges: gray, thin.
-2. Loaded trajectories: one thicker `LINE_LIST` per trajectory, each
-   `trajectory_id` assigned a deterministic distinct color.
-
-The trajectory color does not encode AVAILABLE/COLLISION. That information is
-carried by `source_state` in `/net_loaded_trajectories`.
-
-## Initial configuration
-
-```yaml
-size_x: 20.0
-size_y: 20.0
-size_z: 10.0
-density_net: 1.0
-publish_period_ms: 1000
-```
+Therefore disconnected mission components remain visually disconnected without
+any additional marker workaround.
 
 ## Build
 
+Because `static_trajectory_manager/StaticTrajectory.msg` changed, clean this
+package and its upstream interface packages before compiling:
+
 ```bash
 cd ~/a_space_ws
-rm -rf build/a_space_virtual_net install/a_space_virtual_net
-colcon build --symlink-install --packages-select a_space_virtual_net
+
+rm -rf build/static_trajectory_manager \
+       build/static_trajectory_conflict_manager \
+       build/a_space_virtual_net
+
+rm -rf install/static_trajectory_manager \
+       install/static_trajectory_conflict_manager \
+       install/a_space_virtual_net
+
+colcon build --symlink-install \
+  --packages-up-to a_space_virtual_net
+
 source install/setup.bash
-```
-
-## Launch
-
-```bash
-ros2 launch a_space_virtual_net a_space_virtual_net.launch.py
 ```
 
 ## Inspect
@@ -176,5 +263,5 @@ ros2 launch a_space_virtual_net a_space_virtual_net.launch.py
 ros2 topic echo /net_loaded_trajectories
 ```
 
-This topic is intended to become the geometric input of the next
-`static_trajectory_collision_clasiffier_node`.
+For a trajectory with several `mission[]` components, verify that no lattice
+segments exist across the intended gaps.

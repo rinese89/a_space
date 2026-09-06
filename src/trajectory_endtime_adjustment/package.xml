@@ -1,9 +1,10 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>trajectory_endtime_adjustment</name>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <description>
-    Computes trajectory timing corrections from active-trajectory lifecycle,
+    Computes trajectory timing corrections from active-trajectory lifecycle
+    while preserving the complete multi-mission StaticTrajectory geometry,
     including duration-relative correction for delayed priority operations.
   </description>
 

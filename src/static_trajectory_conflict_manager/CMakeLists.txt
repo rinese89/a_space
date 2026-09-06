@@ -30,6 +30,11 @@ add_executable(
   src/static_trajectory_conflict_manager_node.cpp
 )
 
+target_compile_features(
+  static_trajectory_conflict_manager_node
+  PUBLIC cxx_std_17
+)
+
 ament_target_dependencies(
   static_trajectory_conflict_manager_node
   rclcpp
@@ -38,11 +43,6 @@ ament_target_dependencies(
   std_msgs
   visualization_msgs
   static_trajectory_manager
-)
-
-target_compile_features(
-  static_trajectory_conflict_manager_node
-  PUBLIC cxx_std_17
 )
 
 rosidl_get_typesupport_target(
@@ -71,5 +71,8 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-ament_export_dependencies(rosidl_default_runtime)
+ament_export_dependencies(
+  rosidl_default_runtime
+)
+
 ament_package()

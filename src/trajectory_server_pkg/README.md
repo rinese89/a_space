@@ -1,1 +1,155 @@
-# trajectory_server_pkg — supervision-aware runtime server\n\n## Inputs\n\n```text\n/available_static_trajectories\n  static_trajectory_manager/msg/StaticTrajectoryArray\n\n/supervised_trajectories\n  collision_detection/msg/DetectedCollisionTrajectoryArray\n```\n\nBoth are subscribed with `RELIABLE + TRANSIENT_LOCAL + KeepLast(1)`.\n\n`/supervised_trajectories` is used only to certify that an incomplete AVAILABLE\ngeometry is deliberate. The server does **not** replace the cropped trajectory\nwith the original trajectory stored in the detected-collision message.\n\n## Supervised geometry\n\nA normal available trajectory keeps the original strict geometry requirement:\nTAKEOFF, MISSION and LANDING must all be non-empty and x/y/z lengths must match.\n\nIf `trajectory_id` is currently present in `/supervised_trajectories`, any phase\nmay be empty. This supports the cropped trajectories produced by\n`supervision_trajectory_manager_node`.\n\nThe retained inputs can arrive in either order. The node stores the raw AVAILABLE\nsnapshot and rebuilds its accepted view whenever either AVAILABLE or SUPERVISED\nchanges, so an incomplete supervised trajectory is not lost at startup because\nof DDS delivery order.\n\nRuntime spatial arbitration uses the cropped geometry. Empty phases contribute\nno segments. If the whole cropped representation contains fewer than two points,\nit simply contributes no runtime spatial segments instead of raising an error.\n\nThe active output therefore still contains the cropped trajectory. Later,\n`/<flight_zone>/supervision_node` detects that it is supervised and sends the\n**original complete** `DetectedCollisionTrajectory.trajectory` to the per-UAS\ncontrol manager.\n\n## Outputs\n\n```text\n/active_trajectories\n  static_trajectory_manager/msg/StaticTrajectoryArray\n  RELIABLE + TRANSIENT_LOCAL + KeepLast(1)\n```\n\n```text\n/non_priority_adjustment_trajectories\n  static_trajectory_conflict_manager/msg/CollisionStaticTrajectoryArray\n  RELIABLE + VOLATILE + KeepLast(10)\n```\n\nThe second output is an event stream for a candidate rejected by runtime\narbitration because an already-active spatial blocker has strictly higher\npriority. It preserves the existing collision evidence message structure.\n\nThe server **never publishes `/collision_static_trajectories`**. That topic is\nowned exclusively by `static_trajectory_conflict_manager_node`.\n\n## Existing behavior retained\n\nThe following logic from the previous server is preserved:\n\n- storage at `T-storage_lead_time_s`;\n- publication at `T-publication_lead_time_s`;\n- runtime priority arbitration against active trajectories;\n- equal-priority waiting;\n- delayed activation after a lower-priority active blocker;\n- registration of the original trajectory in\n  `trajectory_endtime_adjustment` when required;\n- rescheduling with `reschedule_margin_s`;\n- active lifetime tracking via PX4 `VehicleStatus` ARM -> DISARM;\n- `/active_trajectories_markers`.\n\n## Build\n\n```bash\ncd ~/a_space_ws\nrm -rf build/trajectory_server_pkg install/trajectory_server_pkg\ncolcon build --symlink-install --packages-up-to trajectory_server_pkg\nsource install/setup.bash\n```\n\n## Launch\n\n```bash\nros2 launch trajectory_server_pkg trajectory_server.launch.py\n```\n
+# trajectory_server_pkg 0.9.0
+
+Adds a minimum valid ARM duration before a DISARM event can complete an active
+trajectory.
+
+## Motivation
+
+The UAS may fail during takeoff because OFFBOARD messages lose continuity.
+
+PX4 can then leave OFFBOARD, recover/land and become DISARMED. The same
+trajectory is still going to be retried by the control layer.
+
+The previous trajectory server logic was:
+
+```text
+ARM observed
+   ->
+DISARM observed
+   ->
+trajectory completed
+```
+
+That incorrectly removed `/active_trajectories` after a failed takeoff.
+
+## New rule
+
+Parameter:
+
+```yaml
+minimum_armed_duration_for_completion_s: 20.0
+```
+
+Completion is now evaluated per ARM cycle:
+
+```text
+NEW ARM
+   |
+   v
+start steady-clock timer
+   |
+   +-- DISARM before 20 s
+   |      |
+   |      +--> ignore DISARM
+   |      +--> keep trajectory ACTIVE
+   |      +--> invalidate this ARM cycle
+   |      +--> wait for NEW ARM from retry
+   |
+   +-- DISARM after >= 20 s
+          |
+          +--> complete trajectory
+          +--> remove from ACTIVE
+```
+
+## Why the ARM cycle is invalidated after a short DISARM
+
+Suppose:
+
+```text
+ARM
+2 s later -> DISARM
+```
+
+If the server kept the original ARM timestamp while the UAS remained DISARMED,
+then 18 s later the same DISARMED state could accidentally satisfy the 20 s
+threshold.
+
+Therefore a short DISARM executes:
+
+```text
+armed_seen = false
+armed_since = empty
+```
+
+The trajectory remains active, but no later DISARM can complete it until a
+fresh `ARMING_STATE_ARMED` sample is observed.
+
+The retry therefore creates:
+
+```text
+ARM #2
+   ->
+new 20 s timer
+```
+
+## Active trajectory lifecycle example
+
+```text
+trajectory enters /active_trajectories
+        |
+        v
+ARM #1
+        |
+        | 4 s
+        v
+DISARM #1                 <- failed takeoff
+        |
+        +--> ignored
+        +--> ACTIVE remains published
+        |
+        v
+control layer retries takeoff
+        |
+        v
+ARM #2
+        |
+        | 75 s operation
+        v
+DISARM #2                 <- real landing
+        |
+        v
+trajectory completed
+```
+
+## Existing runtime arbitration
+
+All previous behavior remains unchanged:
+
+- `/available_static_trajectories`
+- `/supervised_trajectories`
+- `/active_trajectories`
+- runtime spatial arbitration
+- priority waiting/rejection
+- original-trajectory registration
+- `/non_priority_adjustment_trajectories`
+- multi-mission geometry semantics
+
+## Parameter
+
+```yaml
+vehicle_status_suffix: fmu/out/vehicle_status
+vehicle_status_timeout_s: 2.0
+minimum_armed_duration_for_completion_s: 20.0
+```
+
+Set:
+
+```yaml
+minimum_armed_duration_for_completion_s: 0.0
+```
+
+to recover the legacy behavior.
+
+## Build
+
+```bash
+cd ~/a_space_ws
+
+rm -rf build/trajectory_server_pkg
+rm -rf install/trajectory_server_pkg
+
+colcon build --symlink-install \
+  --packages-up-to trajectory_server_pkg
+
+source install/setup.bash
+```

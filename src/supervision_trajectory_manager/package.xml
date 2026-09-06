@@ -1,13 +1,13 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>supervision_trajectory_manager</name>
-  <version>0.4.1</version>
+  <version>0.5.0</version>
 
   <description>
-    Acquires upstream virtual-net supervision crops from deconfliction_manager,
-    injects their legacy StaticTrajectory representation, confirms the crop in
-    AVAILABLE, publishes the original collision payload as supervised state,
-    and synchronizes periodic occurrence times.
+    Acquires ready-to-use multi-mission cropped StaticTrajectory objects from
+    deconfliction_manager, injects them unchanged, confirms them in AVAILABLE,
+    publishes the original collision payload as supervised state, and
+    synchronizes periodic occurrence times.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>
@@ -22,6 +22,7 @@
   <depend>visualization_msgs</depend>
 
   <depend>a_space_virtual_net</depend>
+
   <depend>collision_detection</depend>
   <depend>deconfliction_manager</depend>
   <depend>static_trajectory_manager</depend>

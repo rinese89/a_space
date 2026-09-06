@@ -1,271 +1,138 @@
-# deconfliction_manager 0.5.0
+# deconfliction_manager 0.6.0
 
-ROS 2 Humble package implementing collision-count classification and the first
-geometry crop for supervised trajectories.
+Adaptation to the new multi-mission `static_trajectory_manager/msg/StaticTrajectory`.
 
-## Inputs
+## Classification
 
-```text
-/detected_collision_trajectories
-  collision_detection/msg/DetectedCollisionTrajectoryArray
-
-/net_loaded_trajectories
-  a_space_virtual_net/msg/NetLoadedTrajectoryArray
-```
-
-Both subscriptions use:
+The threshold remains based only on unique collision-node IDs:
 
 ```text
-RELIABLE + TRANSIENT_LOCAL + KeepLast(1)
+unique(collision_nodes[].node_id) < collision_node_threshold
+    -> /requested_supervision_trajectories
+
+unique(collision_nodes[].node_id) >= collision_node_threshold
+    -> /manual_adjustment_trajectories
 ```
 
-`/detected_collision_trajectories` is the authoritative collision snapshot.
+Partial repetitions therefore do not inflate the threshold.
 
-`/net_loaded_trajectories` provides the complete route already discretized into
-adjacent virtual-net edges. It is used only to build the crop; the node does not
-repeat the virtual-net projection algorithm.
+## Multi-mission crop
 
-## Classification change
+Every `mission[i]` is an independent continuous polyline.
 
-The old implementation used:
+The crop still removes a net edge when:
 
 ```text
-collision_nodes.size + collision_segments.size
+edge_id is explicitly conflicting
+OR start_node_id is a collision node
+OR end_node_id is a collision node
 ```
 
-as its threshold resource count.
-
-This version uses only:
+The old de-duplication key `(phase, edge_id)` is replaced by:
 
 ```text
-number of UNIQUE collision node_id values
+(phase, mission_index, edge_id)
 ```
 
-Therefore:
+so repeated partial passes collapse geometrically, while distinct mission
+components remain distinct even if they traverse the same edge.
+
+## CroppedNetSegment
+
+Each retained/removed edge now carries:
 
 ```text
-unique_collision_nodes < collision_node_threshold
-    -> REQUESTED_SUPERVISION
-
-unique_collision_nodes >= collision_node_threshold
-    -> MANUAL_ADJUSTMENT
+mission_index
+source_repetition
+segment
 ```
 
-Default:
+`NO_MISSION` is used for TAKEOFF/LANDING.
 
-```yaml
-collision_node_threshold: 5
+## Ready-to-use cropped StaticTrajectory
+
+`CroppedNetTrajectory` now also contains:
+
+```text
+bool trajectory_materialized
+static_trajectory_manager/StaticTrajectory trajectory
 ```
 
-### Partial repetitions
+MISSION retained edges are grouped by original mission index and split at every
+removed edge/connectivity gap. Every surviving continuous run becomes one new
+element of `trajectory.mission[]`.
 
-A partial mission repetition may traverse the same virtual-net geometry several
-times. It must not multiply the collision count.
+Example:
 
-The manager stores all `collision_nodes[].node_id` values in a set before
-classification. The same lattice node is therefore counted once regardless of
-how many repeated mission traversals touch it.
+```text
+original mission[0]:
+A -> B -> C -> D -> E -> F
 
-The `collision_segments[]` count is not part of the threshold.
+retained:
+A -> B
 
-## New `/requested_supervision_trajectories` type
+E -> F
+```
 
-The topic is now:
+becomes:
+
+```text
+trajectory.mission[0]:
+A -> B
+
+trajectory.mission[1]:
+E -> F
+```
+
+No artificial `B -> E` connector is created.
+
+The original metadata is preserved; only takeoff/mission[]/landing geometry is
+replaced.
+
+TAKEOFF and LANDING are still single polylines in `StaticTrajectory`. Therefore
+`trajectory_materialized=false` only when either phase is split into more than
+one retained run. The exact lattice crop remains available in that exceptional
+case.
+
+## Mission identity
+
+`NetTrajectorySegment` does not yet expose `mission_index` directly. This node
+recovers it from `original_phase_segment_index` and the source-edge counts of
+the original `trajectory.mission[]`.
+
+The repetition number is removed from the geometry de-duplication key, so only
+the first geometric copy is kept.
+
+## Supervision output
 
 ```text
 /requested_supervision_trajectories
 deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
 ```
 
-Each item contains:
+Each item contains the complete ORIGINAL `detected_collision` plus the
+authoritative `cropped_trajectory`.
+
+Downstream `supervision_trajectory_manager_node` should consume directly:
 
 ```text
-RequestedSupervisionTrajectory
-├── detected_collision
-│   └── collision_detection/msg/DetectedCollisionTrajectory
-│       ├── trajectory
-│       ├── loaded_on_net
-│       ├── has_shared_net_space
-│       ├── conflicting_trajectory_ids[]
-│       ├── collision_nodes[]
-│       └── collision_segments[]
-│
-└── cropped_trajectory
-    └── deconfliction_manager/msg/CroppedNetTrajectory
-        ├── retained_nodes[]
-        ├── retained_segments[]
-        ├── removed_node_ids[]
-        ├── removed_segments[]
-        └── removed_edge_ids[]
+requested.cropped_trajectory.trajectory
 ```
 
-So the complete previous collision-detection payload is preserved, and the crop
-is added alongside it.
-
-## Why the crop is represented as virtual-net segments
-
-A `static_trajectory_manager/msg/TrajectorySegment` is one contiguous x/y/z
-polyline.
-
-If a middle section is removed, for example:
+when:
 
 ```text
-(3,3) -> (3,4) -> [removed 3,5 ... 3,8] -> (3,9) -> (3,10)
+complete == true
+trajectory_materialized == true
 ```
 
-putting the remaining points into one `TrajectorySegment` would incorrectly
-create a new artificial edge:
+It should no longer reconstruct the crop itself.
 
-```text
-(3,4) -> (3,9)
-```
+## Manual markers
 
-Therefore the crop is intentionally represented as independent
-`NetTrajectorySegment` edges. It can represent disconnected surviving pieces
-without reconnecting across the removed collision region.
-
-## Exact crop rule
-
-Let:
-
-```text
-C_nodes = all collision_nodes[].node_id
-C_edges = all collision_segments[].edge_id
-```
-
-A complete virtual-net edge is removed if:
-
-```text
-edge_id in C_edges
-OR
-start_node_id in C_nodes
-OR
-end_node_id in C_nodes
-```
-
-The last two conditions remove the boundary edges adjacent to a collision node.
-
-### Example
-
-Complete discretized route:
-
-```text
-(3,3)
- -> (3,4)
- -> (3,5)
- -> (3,6)
- -> (3,7)
- -> (3,8)
- -> (3,9)
- -> (3,10)
-```
-
-Collision nodes:
-
-```text
-(3,5), (3,6), (3,7), (3,8)
-```
-
-Removed edges:
-
-```text
-(3,4) -> (3,5)
-(3,5) -> (3,6)
-(3,6) -> (3,7)
-(3,7) -> (3,8)
-(3,8) -> (3,9)
-```
-
-Retained geometry:
-
-```text
-(3,3) -> (3,4)
-
-(3,9) -> (3,10)
-```
-
-The non-collision boundary nodes `(3,4)` and `(3,9)` remain in
-`retained_nodes[]`.
-
-## Geometry only once
-
-The crop is a geometry representation, not a list of every repeated temporal
-traversal.
-
-`retained_segments[]` and `removed_segments[]` emit only the first occurrence
-of each:
-
-```text
-(phase, edge_id)
-```
-
-Thus partial mission repetitions do not duplicate the same lattice geometry in
-the crop.
-
-The original `source_repetitions` value is retained in the message.
-
-## Crop availability
-
-If the collision snapshot arrives before the retained
-`/net_loaded_trajectories` snapshot, the requested item is still published with:
-
-```text
-cropped_trajectory.complete = false
-```
-
-When the net snapshot arrives, the manager automatically recomputes and
-republishes the same supervision request with:
-
-```text
-complete = true
-```
-
-Consumers must not use an incomplete crop for reinsertion.
-
-## Manual output
-
-The manual branch remains unchanged:
-
-```text
-/manual_adjustment_trajectories
-collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-## QoS
-
-Outputs:
-
-```text
-/requested_supervision_trajectories
-/manual_adjustment_trajectories
-/deconfliction_manager_markers
-```
-
-use:
-
-```text
-RELIABLE + TRANSIENT_LOCAL + KeepLast(1)
-```
-
-and are also republished every `publish_period_ms`.
-
-## Important downstream change
-
-Because `/requested_supervision_trajectories` has a new message type,
-`supervision_trajectory_manager_node` must be updated to subscribe to:
-
-```text
-deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
-```
-
-instead of:
-
-```text
-collision_detection/msg/DetectedCollisionTrajectoryArray
-```
-
-It should consume `cropped_trajectory` directly rather than recomputing the crop
-from the original sparse `StaticTrajectory`.
+Manual-adjustment geometry is now drawn with `LINE_LIST` over the internal edges
+of takeoff, every mission[i], and landing. No visual connectors are introduced
+between independent mission components.
 
 ## Build
 
@@ -281,19 +148,5 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-## Check topics
-
-```bash
-ros2 topic info /requested_supervision_trajectories
-ros2 topic info /manual_adjustment_trajectories
-```
-
-Expected:
-
-```text
-/requested_supervision_trajectories
-Type: deconfliction_manager/msg/RequestedSupervisionTrajectoryArray
-
-/manual_adjustment_trajectories
-Type: collision_detection/msg/DetectedCollisionTrajectoryArray
-```
+Because the deconfliction messages changed, rebuild downstream consumers after
+this package.

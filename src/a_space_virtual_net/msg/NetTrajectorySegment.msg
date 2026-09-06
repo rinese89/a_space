@@ -18,9 +18,20 @@ geometry_msgs/Point start
 geometry_msgs/Point end
 float64 length_m
 
-# Phase and phase-local segment index in the expanded original operation.
+# Phase and phase-local source-segment index in the expanded operation.
+#
+# With the multi-mission StaticTrajectory interface, all mission components
+# share the MISSION phase. The index is monotonically increasing across:
+#
+#   repetition 0: mission[0], mission[1], ...
+#   repetition 1: mission[0], mission[1], ...
+#
+# Consecutive indices DO NOT imply geometric continuity between independent
+# mission components.
 uint8 phase
 uint32 original_phase_segment_index
 
-# Order of this lattice edge inside the complete projected trajectory.
+# Order of this lattice edge inside the projected output stream.
+# Consecutive net_segment_index values also do NOT imply that two edges are
+# geometrically connected; start_node_id/end_node_id define connectivity.
 uint32 net_segment_index

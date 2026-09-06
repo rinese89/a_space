@@ -87,6 +87,14 @@ struct PairState
 
   PairMode mode{PairMode::PRIMARY_SUPERVISED_CONTROL};
 
+  // The UAS-to-UAS safety-distance state machine is dormant until the
+  // supervised UAS comes within collision_monitor_activation_distance_m of one
+  // of the ORIGINAL collision segments. Once activated, it stays latched for
+  // the lifetime of this supervised/counterpart pair.
+  bool safety_monitoring_active{false};
+  double activation_segment_distance_m{
+    std::numeric_limits<double>::infinity()};
+
   bool initial_pause_cycle_done{false};
 
   // Used while the supervised UAS is the primary controlled vehicle.
@@ -162,6 +170,14 @@ public:
     control_action_suffix_ = trim_slashes(
       declare_parameter<std::string>("control_action_suffix", "supervision_control"));
 
+    // The UAS-to-UAS safety-distance logic is not started merely because a
+    // supervised pair exists. It is armed only when the supervised UAS is this
+    // close to one of the stored collision segments.
+    collision_monitor_activation_distance_m_ =
+      declare_parameter<double>(
+      "collision_monitor_activation_distance_m",
+      2.0);
+
     security_distance_m_ = declare_parameter<double>("security_distance_m", 1.0);
     use_3d_distance_ = declare_parameter<bool>("use_3d_distance", true);
     zone_status_timeout_s_ = declare_parameter<double>("zone_status_timeout_s", 2.0);
@@ -221,10 +237,12 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "[/%s] supervision_node ready | available='%s' | supervised='%s' | active='%s' | "
-      "security_distance=%.3f m | progress_timeout=%.2f s | progress_epsilon=%.3f m | "
+      "activation_distance=%.3f m to collision segments | security_distance=%.3f m | "
+      "progress_timeout=%.2f s | progress_epsilon=%.3f m | "
       "collision_exit=%.3f+%.3f m | action_suffix='%s'",
       flight_zone_id_.c_str(), available_topic_.c_str(), supervised_topic_.c_str(),
-      active_topic_.c_str(), security_distance_m_, distance_progress_timeout_s_,
+      active_topic_.c_str(), collision_monitor_activation_distance_m_,
+      security_distance_m_, distance_progress_timeout_s_,
       distance_progress_epsilon_m_, collision_exit_distance_m_,
       collision_exit_hysteresis_m_, control_action_suffix_.c_str());
   }
@@ -246,6 +264,14 @@ private:
 
     if (zone_status_suffix_.empty() || control_action_suffix_.empty() || markers_topic_.empty()) {
       throw std::runtime_error("Topic/action suffixes and markers_topic must not be empty");
+    }
+
+    if (
+      !std::isfinite(collision_monitor_activation_distance_m_) ||
+      collision_monitor_activation_distance_m_ <= 0.0)
+    {
+      throw std::runtime_error(
+              "collision_monitor_activation_distance_m must be finite and > 0");
     }
 
     if (!std::isfinite(security_distance_m_) || security_distance_m_ <= 0.0) {
@@ -700,6 +726,26 @@ private:
     return std::sqrt(dx * dx + dy * dy + dz * dz);
   }
 
+  double distance_to_collision_segments(
+    const DetectedCollisionTrajectory & detected,
+    const geometry_msgs::msg::Point & position) const
+  {
+    double best = std::numeric_limits<double>::infinity();
+
+    // Activation is intentionally based ONLY on collision segments.
+    // Collision nodes remain part of the later clearance-region calculation.
+    for (const auto & segment : detected.collision_segments) {
+      best = std::min(
+        best,
+        point_segment_distance(
+          position,
+          segment.start,
+          segment.end));
+    }
+
+    return best;
+  }
+
   double distance_to_collision_region(
     const DetectedCollisionTrajectory & detected,
     const geometry_msgs::msg::Point & position) const
@@ -843,7 +889,104 @@ private:
         state.collision_region_distance_m =
           std::numeric_limits<double>::infinity();
 
-        // The supervised UAS is always part of this control sequence.
+        // --------------------------------------------------------------
+        // PROXIMITY ARMING GATE
+        // --------------------------------------------------------------
+        // Do not start PAUSE/RESUME safety-distance supervision merely
+        // because both trajectories are active. First require the supervised
+        // UAS to approach one of the ORIGINAL collision segments.
+        //
+        // Once safety_monitoring_active becomes true it remains latched for
+        // this pair, preventing threshold chatter around 2 m.
+        if (!state.safety_monitoring_active) {
+          const VehicleZoneStatus * activation_status = nullptr;
+          const bool activation_status_fresh =
+            fresh_status_locked(
+            supervised_uas,
+            activation_status);
+
+          if (
+            !activation_status_fresh ||
+            activation_status == nullptr)
+          {
+            next_pairs[pair_key] = state;
+            continue;
+          }
+
+          const std::string collision_frame =
+            trim_slashes(
+            detected.trajectory.frame_id);
+          const std::string activation_frame =
+            trim_slashes(
+            activation_status->header.frame_id);
+
+          if (
+            collision_frame.empty() ||
+            collision_frame != activation_frame)
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              2000,
+              "[/%s] Cannot arm safety monitoring for supervised trajectory '%s': "
+              "collision frame='%s', zone_status frame='%s'",
+              flight_zone_id_.c_str(),
+              supervised_id.c_str(),
+              collision_frame.c_str(),
+              activation_frame.c_str());
+
+            next_pairs[pair_key] = state;
+            continue;
+          }
+
+          state.activation_segment_distance_m =
+            distance_to_collision_segments(
+            detected,
+            activation_status->position);
+
+          if (!std::isfinite(
+              state.activation_segment_distance_m))
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              2000,
+              "[/%s] Cannot arm safety monitoring for supervised trajectory '%s': "
+              "no usable collision_segments are available",
+              flight_zone_id_.c_str(),
+              supervised_id.c_str());
+
+            next_pairs[pair_key] = state;
+            continue;
+          }
+
+          if (
+            state.activation_segment_distance_m >
+            collision_monitor_activation_distance_m_)
+          {
+            // Pair exists, but it is still outside the collision-approach
+            // region. No UAS is controlled by this pair yet.
+            next_pairs[pair_key] = state;
+            continue;
+          }
+
+          state.safety_monitoring_active = true;
+          state.initial_pause_cycle_done = false;
+          state.progress_window_active = false;
+
+          RCLCPP_INFO(
+            get_logger(),
+            "[/%s] Safety-distance monitoring ARMED for supervised trajectory '%s' "
+            "vs '%s' | distance_to_collision_segment=%.3f m <= %.3f m",
+            flight_zone_id_.c_str(),
+            supervised_id.c_str(),
+            counterpart_id.c_str(),
+            state.activation_segment_distance_m,
+            collision_monitor_activation_distance_m_);
+        }
+
+        // Only after the proximity gate is armed does this pair participate in
+        // PAUSE/RESUME aggregation.
         controlled_uas_seen.insert(supervised_uas);
 
         if (state.counterpart_control_engaged) {
@@ -1210,22 +1353,36 @@ private:
     pair_states_ = std::move(next_pairs);
   }
 
-  static void append_segment_points(
-    std::vector<geometry_msgs::msg::Point> & out, const TrajectorySegment & segment)
+  static void append_segment_edges(
+    std::vector<geometry_msgs::msg::Point> & out,
+    const TrajectorySegment & segment)
   {
-    for (std::size_t i = 0U; i < point_count(segment); ++i) {
+    const std::size_t count = point_count(segment);
+    if (count < 2U) {
+      return;
+    }
+
+    for (std::size_t i = 1U; i < count; ++i) {
+      out.push_back(point_at(segment, i - 1U));
       out.push_back(point_at(segment, i));
     }
   }
 
-  static std::vector<geometry_msgs::msg::Point> expanded_points(const StaticTrajectory & trajectory)
+  static std::vector<geometry_msgs::msg::Point>
+  trajectory_line_list_points(
+    const StaticTrajectory & trajectory)
   {
     std::vector<geometry_msgs::msg::Point> out;
-    append_segment_points(out, trajectory.takeoff);
-    for (uint32_t r = 0U; r < std::max<uint32_t>(1U, trajectory.repetitions); ++r) {
-      append_segment_points(out, trajectory.mission);
+
+    // Every trajectory component is an independent polyline. In particular,
+    // never add an implicit edge between mission[i] and mission[i+1].
+    append_segment_edges(out, trajectory.takeoff);
+
+    for (const auto & mission : trajectory.mission) {
+      append_segment_edges(out, mission);
     }
-    append_segment_points(out, trajectory.landing);
+
+    append_segment_edges(out, trajectory.landing);
     return out;
   }
 
@@ -1247,14 +1404,14 @@ private:
         displayed = &supervised_.at(trajectory_id).trajectory;
       }
 
-      const auto points = expanded_points(*displayed);
+      const auto points = trajectory_line_list_points(*displayed);
       if (points.size() >= 2U) {
         Marker line;
         line.header.stamp = now();
         line.header.frame_id = displayed->frame_id;
         line.ns = supervised_active ? "supervision/active_supervised" : "supervision/active_normal";
         line.id = marker_id++;
-        line.type = Marker::LINE_STRIP;
+        line.type = Marker::LINE_LIST;
         line.action = Marker::ADD;
         line.pose.orientation.w = 1.0;
         line.scale.x = trajectory_line_width_;
@@ -1397,7 +1554,13 @@ private:
       text.color = color(1.0F, 1.0F, 1.0F, 1.0F);
 
       std::ostringstream pair_label;
-      pair_label << pair_mode_name(pair.mode);
+      pair_label << pair_mode_name(pair.mode)
+                 << " | safety="
+                 << (pair.safety_monitoring_active ? "ARMED" : "WAITING");
+      if (std::isfinite(pair.activation_segment_distance_m)) {
+        pair_label << " | segment_d="
+                   << pair.activation_segment_distance_m << " m";
+      }
       if (pair.status_valid) {
         pair_label << " | d=" << pair.distance_m << " m";
       }
@@ -1429,6 +1592,7 @@ private:
   std::string control_action_suffix_;
   std::string markers_topic_;
 
+  double collision_monitor_activation_distance_m_{2.0};
   double security_distance_m_{1.0};
   bool use_3d_distance_{true};
   double zone_status_timeout_s_{2.0};

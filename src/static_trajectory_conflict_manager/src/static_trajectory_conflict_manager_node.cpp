@@ -56,12 +56,6 @@ struct Vec3
   double z{0.0};
 };
 
-struct TaggedPoint
-{
-  Vec3 point;
-  uint8_t phase{0U};
-};
-
 struct GeometrySegment
 {
   Vec3 start;
@@ -391,16 +385,27 @@ static std::vector<Vec3> segment_points(
   return points;
 }
 
-static void append_tagged_points(
-  std::vector<TaggedPoint> & target,
-  const std::vector<Vec3> & source,
-  uint8_t phase)
+static void append_polyline_segments(
+  std::vector<GeometrySegment> & target,
+  const std::vector<Vec3> & points)
 {
-  for (const auto & point : source) {
+  if (points.size() < 2U) {
+    return;
+  }
+
+  target.reserve(
+    target.size() +
+    points.size() - 1U);
+
+  for (
+    std::size_t index = 1U;
+    index < points.size();
+    ++index)
+  {
     target.push_back(
-      TaggedPoint{
-        point,
-        phase});
+      GeometrySegment{
+        points[index - 1U],
+        points[index]});
   }
 }
 
@@ -420,62 +425,81 @@ static std::vector<GeometrySegment> build_geometry_segments(
       trajectory.trajectory_id,
       "takeoff");
 
-  const auto mission =
-    segment_points(
-      trajectory.mission,
-      trajectory.trajectory_id,
-      "mission");
-
   const auto landing =
     segment_points(
       trajectory.landing,
       trajectory.trajectory_id,
       "landing");
 
-  std::vector<TaggedPoint> expanded;
+  std::vector<
+    std::vector<Vec3>> missions;
 
-  expanded.reserve(
-    takeoff.size() +
-    mission.size() * trajectory.repetitions +
-    landing.size());
+  missions.reserve(
+    trajectory.mission.size());
 
-  append_tagged_points(expanded, takeoff, 0U);
+  std::size_t geometry_segment_count = 0U;
 
-  for (
-    uint32_t repetition = 0U;
-    repetition < trajectory.repetitions;
-    ++repetition)
-  {
-    append_tagged_points(
-      expanded,
-      mission,
-      1U);
+  if (takeoff.size() >= 2U) {
+    geometry_segment_count +=
+      takeoff.size() - 1U;
   }
 
-  append_tagged_points(
-    expanded,
-    landing,
-    2U);
+  for (
+    std::size_t mission_index = 0U;
+    mission_index < trajectory.mission.size();
+    ++mission_index)
+  {
+    auto points =
+      segment_points(
+      trajectory.mission[mission_index],
+      trajectory.trajectory_id,
+      "mission[" +
+      std::to_string(mission_index) +
+      "]");
+
+    if (points.size() >= 2U) {
+      geometry_segment_count +=
+        points.size() - 1U;
+    }
+
+    missions.push_back(
+      std::move(points));
+  }
+
+  if (landing.size() >= 2U) {
+    geometry_segment_count +=
+      landing.size() - 1U;
+  }
 
   std::vector<GeometrySegment> segments;
+  segments.reserve(
+    geometry_segment_count);
 
-  if (expanded.size() < 2U) {
-    return segments;
+  // Every TrajectorySegment is an independent continuous polyline.
+  //
+  // There is NO implicit geometry between:
+  //   takeoff.back()        -> mission[0].front()
+  //   mission[i].back()     -> mission[i + 1].front()
+  //   mission.back().back() -> landing.front()
+  //
+  // This preserves gaps introduced by supervised trajectory cropping.
+  append_polyline_segments(
+    segments,
+    takeoff);
+
+  for (const auto & mission : missions) {
+    append_polyline_segments(
+      segments,
+      mission);
   }
 
-  segments.reserve(expanded.size() - 1U);
+  append_polyline_segments(
+    segments,
+    landing);
 
-  for (
-    std::size_t index = 1U;
-    index < expanded.size();
-    ++index)
-  {
-    segments.push_back(
-      GeometrySegment{
-        expanded[index - 1U].point,
-        expanded[index].point});
-  }
-
+  // Partial repetitions repeat exactly the same mission collection. This node
+  // performs a Boolean spatial-overlap test, so duplicating those same edges
+  // repetitions times cannot change the collision result.
   return segments;
 }
 
@@ -694,7 +718,22 @@ static uint64_t trajectory_signature(
   hash.add_string(trajectory.action_name);
 
   hash_segment(hash, trajectory.takeoff);
-  hash_segment(hash, trajectory.mission);
+
+  const uint64_t mission_count =
+    static_cast<uint64_t>(
+    trajectory.mission.size());
+
+  hash.add_scalar(
+    mission_count);
+
+  for (const auto & mission :
+    trajectory.mission)
+  {
+    hash_segment(
+      hash,
+      mission);
+  }
+
   hash_segment(hash, trajectory.landing);
 
   hash.add_double(trajectory.goal_tolerance);
@@ -1216,7 +1255,10 @@ private:
           trajectory_id +
           " | P=" +
           std::to_string(
-            trajectory.priority);
+            trajectory.priority) +
+          " | M=" +
+          std::to_string(
+            trajectory.mission.size());
 
         output.markers.push_back(
           std::move(text));

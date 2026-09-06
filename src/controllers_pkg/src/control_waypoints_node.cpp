@@ -150,6 +150,23 @@ public:
         takeoff_tolerance_z_ = this->declare_parameter<double>(
             "takeoff_tolerance_z", 0.20);
 
+        // Reintento automático de la secuencia de inicio:
+        // si, después de enviar ARM, el UAS no alcanza el punto final del
+        // despegue dentro de takeoff_reach_timeout_s, se estabiliza en la
+        // posición actual y se reinicia completamente:
+        // warm-up -> OFFBOARD -> ARM -> ascenso al objetivo.
+        takeoff_reach_timeout_s_ = this->declare_parameter<double>(
+            "takeoff_reach_timeout_s", 15.0);
+
+        // Once PX4 has completed the failsafe descent and reports DISARMED,
+        // keep the node passive for this short settling time before starting
+        // a completely new warm-up -> OFFBOARD -> ARM -> TAKEOFF sequence.
+        takeoff_ground_settle_s_ = this->declare_parameter<double>(
+            "takeoff_ground_settle_s", 1.0);
+
+        takeoff_max_retries_ = this->declare_parameter<int>(
+            "takeoff_max_retries", 0);
+
         landing_tolerance_xy_ = this->declare_parameter<double>(
             "landing_tolerance_xy", 0.30);
         landing_command_retry_s_ = this->declare_parameter<double>(
@@ -268,10 +285,32 @@ private:
     {
         IDLE,
         TAKEOFF,
+        TAKEOFF_RECOVERY_WAIT,
         HOLD,
         MISSION,
         LANDING
     };
+
+    static const char * control_state_name(
+        ControlState state)
+    {
+        switch (state) {
+        case ControlState::IDLE:
+            return "IDLE";
+        case ControlState::TAKEOFF:
+            return "TAKEOFF";
+        case ControlState::TAKEOFF_RECOVERY_WAIT:
+            return "TAKEOFF_RECOVERY_WAIT";
+        case ControlState::HOLD:
+            return "HOLD";
+        case ControlState::MISSION:
+            return "MISSION";
+        case ControlState::LANDING:
+            return "LANDING";
+        default:
+            return "UNKNOWN";
+        }
+    }
 
     static std::string normalise_name(std::string value)
     {
@@ -384,11 +423,15 @@ private:
             control_period_ms_ <= 0.0 ||
             takeoff_tolerance_xy_ <= 0.0 ||
             takeoff_tolerance_z_ <= 0.0 ||
+            takeoff_reach_timeout_s_ <= 0.0 ||
+            takeoff_ground_settle_s_ < 0.0 ||
+            takeoff_max_retries_ < 0 ||
             landing_tolerance_xy_ <= 0.0 ||
             landing_command_retry_s_ <= 0.0)
         {
             throw std::runtime_error(
-                "control_period_ms, takeoff/landing tolerances and landing retry period must be positive");
+                "control_period_ms, takeoff/landing tolerances, takeoff retry "
+                "parameters and landing retry period are invalid");
         }
 
         if (
@@ -526,9 +569,7 @@ private:
         hold_z_ = req->z;
         hold_yaw_enu_ = req->yaw;
 
-        warmup_counter_ = 0;
-        offboard_command_sent_ = false;
-        arm_command_sent_ = false;
+        reset_takeoff_retry_state_for_new_request();
         control_state_ = ControlState::TAKEOFF;
 
         res->accepted = true;
@@ -608,11 +649,18 @@ private:
             return rclcpp_action::GoalResponse::REJECT;
         }
 
-        if (control_state_ == ControlState::IDLE ||
-            control_state_ == ControlState::TAKEOFF ||
-            control_state_ == ControlState::LANDING) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Rechazando goal: el dron no está disponible en HOLD para iniciar misión");
+        // FollowWaypoints is accepted ONLY in HOLD.
+        //
+        // Do not maintain a blacklist of non-HOLD states: when a new state such
+        // as TAKEOFF_RECOVERY_WAIT is introduced it must not accidentally
+        // become mission-capable. HOLD is the single valid transition point
+        // from takeoff/recovery into mission execution.
+        if (control_state_ != ControlState::HOLD) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Rechazando FollowWaypoints: el dron no está en HOLD "
+                "(estado actual=%s)",
+                control_state_name(control_state_));
             return rclcpp_action::GoalResponse::REJECT;
         }
 
@@ -666,6 +714,33 @@ private:
     void handle_accepted(const std::shared_ptr<GoalHandleFollowWaypoints> goal_handle)
     {
         const auto goal = goal_handle->get_goal();
+
+        // Defensive barrier against a state transition occurring after
+        // handle_goal() returned ACCEPT but before this callback executes.
+        // A mission must never overwrite TAKEOFF_RECOVERY_WAIT, TAKEOFF,
+        // LANDING, etc.
+        if (control_state_ != ControlState::HOLD) {
+            auto result =
+                std::make_shared<FollowWaypoints::Result>();
+
+            result->success = false;
+            result->message =
+                std::string(
+                "FollowWaypoints became invalid before execution: "
+                "controller state is ") +
+                control_state_name(control_state_);
+            result->waypoints_reached = 0;
+
+            goal_handle->abort(result);
+
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "[%s] FollowWaypoints aborted before acquisition: "
+                "controller left HOLD (state=%s)",
+                namespace_path_.c_str(),
+                control_state_name(control_state_));
+            return;
+        }
 
         active_goal_handle_ = goal_handle;
 
@@ -1135,6 +1210,10 @@ private:
             tick_takeoff(ts);
             return;
 
+        case ControlState::TAKEOFF_RECOVERY_WAIT:
+            tick_takeoff_recovery_wait();
+            return;
+
         case ControlState::HOLD:
             publish_position_offboard_control_mode(ts);
             publish_position_setpoint_enu(ts, hold_x_, hold_y_, hold_z_, hold_yaw_enu_);
@@ -1150,65 +1229,367 @@ private:
         }
     }
 
+    void reset_takeoff_command_sequence()
+    {
+        warmup_counter_ = 0;
+        offboard_command_sent_ = false;
+        arm_command_sent_ = false;
+        takeoff_attempt_timer_active_ = false;
+        takeoff_offboard_seen_ = false;
+        takeoff_armed_seen_ = false;
+    }
+
+    void reset_takeoff_retry_state_for_new_request()
+    {
+        reset_takeoff_command_sequence();
+
+        takeoff_retry_count_ = 0U;
+        takeoff_retry_lockout_ = false;
+        takeoff_recovery_reason_.clear();
+
+        takeoff_ground_disarmed_seen_ = false;
+        takeoff_ground_disarmed_since_ =
+            std::chrono::steady_clock::time_point{};
+        takeoff_attempt_started_at_ =
+            std::chrono::steady_clock::time_point{};
+
+        // Diagnostic reference only. PX4 DISARMED is the authoritative signal
+        // used to decide that the failsafe landing has completed.
+        takeoff_initial_ground_z_ = current_z_;
+    }
+
+    void begin_takeoff_recovery_wait(
+        const std::string & reason)
+    {
+        if (
+            control_state_ ==
+            ControlState::TAKEOFF_RECOVERY_WAIT)
+        {
+            return;
+        }
+
+        ++takeoff_retry_count_;
+        takeoff_recovery_reason_ = reason;
+
+        // CRITICAL:
+        // From this point the node intentionally stops publishing
+        // OffboardControlMode and TrajectorySetpoint. We do not send another
+        // mode request, ARM, DISARM or LAND command. PX4 is allowed to execute
+        // its configured OFFBOARD-loss failsafe and return to the ground.
+        reset_takeoff_command_sequence();
+
+        takeoff_ground_disarmed_seen_ = false;
+        takeoff_ground_disarmed_since_ =
+            std::chrono::steady_clock::time_point{};
+
+        control_state_ =
+            ControlState::TAKEOFF_RECOVERY_WAIT;
+
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "[%s] TAKEOFF attempt failed -> passive PX4 recovery | retry=%u | "
+            "reason='%s'. OFFBOARD/setpoint/ARM publications are stopped. "
+            "Waiting for PX4 to land and report DISARMED before a complete restart. "
+            "FollowWaypoints remains rejected until HOLD is reached again.",
+            namespace_path_.c_str(),
+            takeoff_retry_count_,
+            reason.c_str());
+    }
+
+    void tick_takeoff_recovery_wait()
+    {
+        // Deliberately publish nothing here. This state exists specifically so
+        // the controller does not fight PX4's OFFBOARD-loss safety behavior.
+        if (!has_vehicle_status_) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "[%s] TAKEOFF recovery waiting for vehicle_status; "
+                "no OFFBOARD/setpoint commands are being sent",
+                namespace_path_.c_str());
+            return;
+        }
+
+        if (
+            arming_state_ !=
+            px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "[%s] TAKEOFF recovery: PX4 failsafe in progress | "
+                "nav_state=%u | arming_state=%u | current_z=%.2f | "
+                "waiting for DISARMED",
+                namespace_path_.c_str(),
+                static_cast<unsigned>(nav_state_),
+                static_cast<unsigned>(arming_state_),
+                current_z_);
+            return;
+        }
+
+        const auto steady_now =
+            std::chrono::steady_clock::now();
+
+        if (!takeoff_ground_disarmed_seen_) {
+            takeoff_ground_disarmed_seen_ = true;
+            takeoff_ground_disarmed_since_ =
+                steady_now;
+
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[%s] PX4 reports DISARMED after failed TAKEOFF | "
+                "current_z=%.2f (initial ground_z=%.2f). "
+                "Waiting %.2f s on ground before restart.",
+                namespace_path_.c_str(),
+                current_z_,
+                takeoff_initial_ground_z_,
+                takeoff_ground_settle_s_);
+            return;
+        }
+
+        const double grounded_elapsed_s =
+            std::chrono::duration<double>(
+                steady_now -
+                takeoff_ground_disarmed_since_).count();
+
+        if (grounded_elapsed_s < takeoff_ground_settle_s_) {
+            return;
+        }
+
+        // takeoff_max_retries=0 means unlimited retries.
+        // The counter is incremented when a failed attempt enters recovery.
+        if (
+            takeoff_max_retries_ > 0 &&
+            static_cast<int>(takeoff_retry_count_) >
+            takeoff_max_retries_)
+        {
+            takeoff_retry_lockout_ = true;
+
+            RCLCPP_ERROR_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                3000,
+                "[%s] TAKEOFF retry limit exhausted | failures=%u | max_retries=%d. "
+                "UAS is DISARMED on the ground; automatic restart is inhibited.",
+                namespace_path_.c_str(),
+                takeoff_retry_count_,
+                takeoff_max_retries_);
+            return;
+        }
+
+        // PX4 has landed and disarmed. Start exactly as if a fresh takeoff
+        // attempt were beginning, while preserving the original ArmTakeoff
+        // endpoint and the already acquired higher-level mission.
+        reset_takeoff_command_sequence();
+
+        takeoff_ground_disarmed_seen_ = false;
+        takeoff_ground_disarmed_since_ =
+            std::chrono::steady_clock::time_point{};
+        takeoff_initial_ground_z_ = current_z_;
+
+        control_state_ =
+            ControlState::TAKEOFF;
+
+        RCLCPP_WARN(
+            this->get_logger(),
+            "[%s] Ground recovery complete -> restarting TAKEOFF from zero | "
+            "retry=%u | warm-up -> OFFBOARD -> ARM -> target=(%.2f, %.2f, %.2f)",
+            namespace_path_.c_str(),
+            takeoff_retry_count_,
+            hold_x_,
+            hold_y_,
+            hold_z_);
+    }
+
     void tick_takeoff(uint64_t ts)
     {
+        const auto steady_now =
+            std::chrono::steady_clock::now();
+
+        if (takeoff_retry_lockout_) {
+            // Lockout can only be reached while the aircraft is already
+            // DISARMED on the ground. Do not publish OFFBOARD/setpoints.
+            return;
+        }
+
         warmup_counter_++;
+
+        // Normal startup streaming. If the computer stalls and these messages
+        // lose continuity, PX4 is expected to leave OFFBOARD according to its
+        // configured failsafe. That loss is detected below and we then stop
+        // publishing completely until the vehicle is back on the ground.
         publish_position_offboard_control_mode(ts);
-        publish_position_setpoint_enu(ts, hold_x_, hold_y_, hold_z_, hold_yaw_enu_);
+        publish_position_setpoint_enu(
+            ts,
+            hold_x_,
+            hold_y_,
+            hold_z_,
+            hold_yaw_enu_);
 
         if (warmup_counter_ == 50 && !offboard_command_sent_) {
-            // VEHICLE_CMD_DO_SET_MODE = 176 | param1=1 custom mode | param2=6 offboard
+            // VEHICLE_CMD_DO_SET_MODE = 176 | param1=1 custom mode |
+            // param2=6 offboard
             send_vehicle_command(176, 1.0f, 6.0f);
             offboard_command_sent_ = true;
-            RCLCPP_INFO(this->get_logger(),
-                        "Comando offboard enviado");
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[%s] OFFBOARD request sent | takeoff retry=%u",
+                namespace_path_.c_str(),
+                takeoff_retry_count_);
         }
 
         if (warmup_counter_ == 100 && !arm_command_sent_) {
             // VEHICLE_CMD_COMPONENT_ARM_DISARM = 400 | param1=1 arm
-            RCLCPP_INFO(this->get_logger(),
-                        "Comando de armado enviado");
-
             send_vehicle_command(400, 1.0f);
             arm_command_sent_ = true;
+
+            takeoff_attempt_started_at_ =
+                steady_now;
+            takeoff_attempt_timer_active_ = true;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[%s] ARM request sent | takeoff retry=%u | "
+                "reach_timeout=%.2f s",
+                namespace_path_.c_str(),
+                takeoff_retry_count_,
+                takeoff_reach_timeout_s_);
         }
 
-        const double dist_xy = norm2d(hold_x_ - current_x_, hold_y_ - current_y_);
-        const double err_z = std::abs(hold_z_ - current_z_);
-        
-        if (!arm_command_sent_) {
-            RCLCPP_INFO(this->get_logger(),
-                        "[%s] Esperando comando de armado / takeoff hacia hold=(%.2f, %.2f, %.2f)",
-                        namespace_path_.c_str(), hold_x_, hold_y_, hold_z_);
+        // Track whether PX4 actually entered the expected startup states.
+        if (has_vehicle_status_) {
+            if (
+                nav_state_ ==
+                px4_msgs::msg::VehicleStatus::
+                NAVIGATION_STATE_OFFBOARD)
+            {
+                takeoff_offboard_seen_ = true;
+            }
+
+            if (
+                arming_state_ ==
+                px4_msgs::msg::VehicleStatus::
+                ARMING_STATE_ARMED)
+            {
+                takeoff_armed_seen_ = true;
+            }
+        }
+
+        const double dist_xy =
+            norm2d(
+                hold_x_ - current_x_,
+                hold_y_ - current_y_);
+
+        const double err_z =
+            std::abs(
+                hold_z_ - current_z_);
+
+        const bool xy_reached =
+            dist_xy <= takeoff_tolerance_xy_;
+        const bool z_reached =
+            err_z <= takeoff_tolerance_z_;
+
+        if (xy_reached && z_reached) {
+            control_state_ =
+                ControlState::HOLD;
+            takeoff_attempt_timer_active_ = false;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[%s] Stable takeoff endpoint reached at "
+                "(%.2f, %.2f, %.2f) after %u retries",
+                namespace_path_.c_str(),
+                hold_x_,
+                hold_y_,
+                hold_z_,
+                takeoff_retry_count_);
             return;
         }
 
-        const bool xy_reached = dist_xy <= takeoff_tolerance_xy_;
-        const bool z_reached  = err_z   <= takeoff_tolerance_z_;
+        // ------------------------------------------------------------
+        // PX4 OFFBOARD-LOSS DETECTION
+        // ------------------------------------------------------------
+        // Only consider this a failed takeoff after OFFBOARD was positively
+        // observed at least once. This prevents interpreting the normal warm-up
+        // period before OFFBOARD engagement as a failure.
+        if (
+            arm_command_sent_ &&
+            takeoff_offboard_seen_ &&
+            has_vehicle_status_ &&
+            nav_state_ !=
+            px4_msgs::msg::VehicleStatus::
+            NAVIGATION_STATE_OFFBOARD)
+        {
+            begin_takeoff_recovery_wait(
+                "PX4 left OFFBOARD before the takeoff endpoint was reached");
+            return;
+        }
 
-        if (xy_reached && z_reached) {
-            control_state_ = ControlState::HOLD;
-        
-            RCLCPP_INFO(this->get_logger(),
-                        "[%s] Vuelo estable alcanzado en hold=(%.2f, %.2f, %.2f)",
-                        namespace_path_.c_str(), hold_x_, hold_y_, hold_z_);
+        // If the vehicle was observed armed and then becomes DISARMED before
+        // reaching the endpoint, the failed flight has already completed its
+        // landing/disarm. Enter the same passive recovery state; the next tick
+        // can immediately begin the ground-settle confirmation.
+        if (
+            arm_command_sent_ &&
+            takeoff_armed_seen_ &&
+            has_vehicle_status_ &&
+            arming_state_ ==
+            px4_msgs::msg::VehicleStatus::
+            ARMING_STATE_DISARMED)
+        {
+            begin_takeoff_recovery_wait(
+                "PX4 became DISARMED before the takeoff endpoint was reached");
+            return;
         }
-        else if (!xy_reached && !z_reached) {
-            RCLCPP_INFO(this->get_logger(),
-                        "[%s] En proceso hacia hold=(%.2f, %.2f, %.2f). dist_xy=%.2f, err_z=%.2f",
-                        namespace_path_.c_str(), hold_x_, hold_y_, hold_z_, dist_xy, err_z);
+
+        // Fallback: if the endpoint is never reached but OFFBOARD loss is not
+        // observed cleanly (for example because CPU starvation delayed status
+        // processing as well), stop OFFBOARD streaming intentionally and let
+        // PX4 execute the same configured failsafe.
+        if (takeoff_attempt_timer_active_) {
+            const double elapsed_s =
+                std::chrono::duration<double>(
+                    steady_now -
+                    takeoff_attempt_started_at_).count();
+
+            if (elapsed_s >= takeoff_reach_timeout_s_) {
+                begin_takeoff_recovery_wait(
+                    "takeoff endpoint timeout; forcing passive PX4 recovery by stopping OFFBOARD streaming");
+                return;
+            }
         }
-        else if (xy_reached && !z_reached) {
-            RCLCPP_INFO(this->get_logger(),
-                        "[%s] Posición x,y alcanzada. Ajustando altura hacia z=%.2f. err_z=%.2f",
-                        namespace_path_.c_str(), hold_z_, err_z);
+
+        if (!arm_command_sent_) {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "[%s] TAKEOFF startup | retry=%u | warmup=%d | "
+                "waiting for OFFBOARD/ARM",
+                namespace_path_.c_str(),
+                takeoff_retry_count_,
+                warmup_counter_);
+            return;
         }
-        else if (!xy_reached && z_reached) {
-            RCLCPP_INFO(this->get_logger(),
-                        "[%s] Altura alcanzada. Ajustando posición x,y hacia hold=(%.2f, %.2f). dist_xy=%.2f",
-                        namespace_path_.c_str(), hold_x_, hold_y_, dist_xy);
-        }
-        
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,
+            "[%s] TAKEOFF in progress | retry=%u | target=(%.2f, %.2f, %.2f) | "
+            "dist_xy=%.2f | err_z=%.2f | offboard_seen=%s | armed_seen=%s",
+            namespace_path_.c_str(),
+            takeoff_retry_count_,
+            hold_x_,
+            hold_y_,
+            hold_z_,
+            dist_xy,
+            err_z,
+            takeoff_offboard_seen_ ? "true" : "false",
+            takeoff_armed_seen_ ? "true" : "false");
     }
 
     void tick_landing(uint64_t ts)
@@ -1340,6 +1721,31 @@ private:
     bool arm_command_sent_{false};
     double takeoff_tolerance_xy_{0.30};
     double takeoff_tolerance_z_{0.20};
+
+    // Automatic restart of the complete startup sequence when OFFBOARD is
+    // lost or the requested takeoff endpoint is not reached after ARM.
+    double takeoff_reach_timeout_s_{15.0};
+    double takeoff_ground_settle_s_{1.0};
+    int takeoff_max_retries_{0};  // 0 = unlimited
+
+    uint32_t takeoff_retry_count_{0U};
+    bool takeoff_retry_lockout_{false};
+    bool takeoff_attempt_timer_active_{false};
+
+    // Positive observations from PX4 status used to distinguish a genuine
+    // OFFBOARD-loss event from the normal startup period.
+    bool takeoff_offboard_seen_{false};
+    bool takeoff_armed_seen_{false};
+
+    // During TAKEOFF_RECOVERY_WAIT no OFFBOARD/setpoint publications are made.
+    // PX4 DISARMED is treated as authoritative completion of the failsafe
+    // landing, consistently with tick_landing().
+    bool takeoff_ground_disarmed_seen_{false};
+    double takeoff_initial_ground_z_{0.0};
+    std::string takeoff_recovery_reason_;
+
+    std::chrono::steady_clock::time_point takeoff_attempt_started_at_{};
+    std::chrono::steady_clock::time_point takeoff_ground_disarmed_since_{};
 
     // LANDING. El servicio arm_takeoff se reutiliza en HOLD por compatibilidad
     // con control_manager_node; la ejecución real usa PX4 NAV_LAND.

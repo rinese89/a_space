@@ -1,6 +1,3 @@
-# Legacy/detail message retained for ABI/API compatibility.
-# The simplified static_trajectory_conflict_manager_node no longer populates it.
-
 uint8 TAKEOFF=0
 uint8 MISSION=1
 uint8 LANDING=2

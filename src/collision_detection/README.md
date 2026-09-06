@@ -1,1 +1,281 @@
-# collision_detection\n\nROS 2 Humble package implementing the second-stage spatial collision detector\nof the A-space chain.\n\n## Role in the architecture\n\nThe simplified `static_trajectory_conflict_manager_node` only answers:\n\n```text\nCOLLISION / AVAILABLE\n```\n\nIt no longer computes collision evidence.\n\n`a_space_virtual_net_node` then projects every trajectory onto the Cartesian\nlattice and publishes:\n\n```text\n/net_loaded_trajectories\n```\n\n`collision_detection_node` combines both retained snapshots and determines the\nexact lattice resources shared by each trajectory already classified as\n`COLLISION`.\n\n## Inputs\n\n```text\n/collision_static_trajectories\n/net_loaded_trajectories\n```\n\nBoth use `RELIABLE + TRANSIENT_LOCAL + KeepLast(1)`.\n\nThe first snapshot defines the target set: only trajectory IDs appearing in\n`/collision_static_trajectories` are enriched by this node.\n\nThe second snapshot is the complete lattice occupancy source and includes both\navailable and collision trajectories.\n\n## Collision semantics on the virtual net\n\n### Shared edge / segment\n\nFor a target trajectory segment:\n\n```text\ntarget.edge_id == other.edge_id\n```\n\nmeans both trajectories occupy the same physical lattice edge.\n\nThe target segment is added to `collision_segments`. Direction does not matter\nbecause `edge_id` identifies the undirected global lattice edge.\n\n### Shared node\n\nA node is marked when its `node_id` is used by at least one other\n`trajectory_id`.\n\nThis detects, for example, two routes that arrive at the same node through\ndifferent edges:\n\n```text\n      B\n      |\nA ----X---- C\n      |\n      D\n```\n\nEven if no complete edge is shared, `X` is reported as a collision node.\n\nA trajectory never conflicts with itself: the target `trajectory_id` is always\nremoved from the edge/node user sets before evaluating a collision.\n\n## Structured output\n\n```text\n/detected_collision_trajectories\n```\n\nType:\n\n```text\ncollision_detection/msg/DetectedCollisionTrajectoryArray\n```\n\nThe output is an authoritative retained snapshot and is republished every\nsecond.\n\nEach target contains:\n\n```text\ntrajectory\nloaded_on_net\nhas_shared_net_space\nconflicting_trajectory_ids[]\ncollision_nodes[]\ncollision_segments[]\n```\n\n### `GridCollisionSegment`\n\nCarries:\n\n```text\nedge_id\naxis\nstart_node_id\nend_node_id\nstart / end\nlength_m\nphase\noriginal_phase_segment_index\nnet_segment_index\nconflicting_trajectory_ids[]\n```\n\nTherefore the next classifier can immediately know both:\n\n1. which exact grid edge is shared; and\n2. which TAKEOFF/MISSION/LANDING segment of the original expanded operation\n   generated it.\n\n### `GridCollisionNode`\n\nCarries:\n\n```text\nnode_id\nposition\nown_net_segment_indices[]\nconflicting_trajectory_ids[]\n```\n\nRepeated occurrences of the same target node are merged into one entry.\n\n## Missing net-loaded trajectory\n\nIf an ID is present in `/collision_static_trajectories` but not yet in\n`/net_loaded_trajectories`, it is still published with:\n\n```text\nloaded_on_net = false\nhas_shared_net_space = false\n```\n\nThis prevents a transient synchronization delay from silently removing a\nfirst-stage collision result.\n\n## Markers\n\n```text\n/detected_collision_trajectories_markers\n```\n\nRViz representation:\n\n```text\nRED LINE_LIST     = shared lattice edges\nYELLOW SPHERES    = shared lattice nodes\nWHITE TEXT        = trajectory ID, counts and conflicting IDs\n```\n\nEvery snapshot starts with `Marker::DELETEALL`, so stale collision geometry is\nremoved immediately.\n\n## Publication period\n\nDefault:\n\n```yaml\npublish_period_ms: 1000\n```\n\nOutputs are also `TRANSIENT_LOCAL`, so late subscribers receive the latest\nsnapshot immediately.\n\n## Example flow\n\n```text\n/collision_static_trajectories\n           |\n           | target IDs\n           v\n  collision_detection_node <------ /net_loaded_trajectories\n           |                              |\n           |                         all net users\n           |\n           +---- build edge_id -> trajectory IDs\n           +---- build node_id -> trajectory IDs\n           |\n           +---- for each collision target\n                     |\n                     +-- shared edge_id ? -> collision segment\n                     +-- shared node_id ? -> collision node\n           |\n           v\n/detected_collision_trajectories\n/detected_collision_trajectories_markers\n```\n\n## Build\n\n```bash\ncd ~/a_space_ws\n\ncolcon build --symlink-install --packages-up-to \\\n  collision_detection\n\nsource install/setup.bash\n```\n\nClean rebuild:\n\n```bash\nrm -rf build/collision_detection\nrm -rf install/collision_detection\n\ncolcon build --symlink-install --packages-select \\\n  collision_detection\n```\n\n## Launch\n\n```bash\nros2 launch collision_detection collision_detection.launch.py\n```\n\n## Inspect\n\n```bash\nros2 topic echo /detected_collision_trajectories\n```\n
+# collision_detection 0.2.0
+
+Adaptation to the new multi-mission
+`static_trajectory_manager/msg/StaticTrajectory` interface.
+
+## StaticTrajectory change
+
+The trajectory embedded in both upstream inputs now contains:
+
+```text
+TrajectorySegment takeoff
+TrajectorySegment[] mission
+TrajectorySegment landing
+```
+
+instead of one single `TrajectorySegment mission`.
+
+## Important architectural point
+
+`collision_detection_node` does **not** rebuild the trajectory geometry from
+`StaticTrajectory`.
+
+It performs collision detection using:
+
+```text
+/net_loaded_trajectories
+  -> NetLoadedTrajectory.segments[]
+```
+
+Those lattice segments have already been generated by
+`a_space_virtual_net_node`, which now understands independent `mission[]`
+polylines.
+
+Therefore this node must not:
+
+- concatenate mission components;
+- create edges between `mission[i]` and `mission[i+1]`;
+- project waypoints onto the net again;
+- reinterpret `repetitions`.
+
+It consumes the authoritative discretized net representation directly.
+
+## Inputs
+
+```text
+/collision_static_trajectories
+  static_trajectory_conflict_manager/msg/CollisionStaticTrajectoryArray
+
+/net_loaded_trajectories
+  a_space_virtual_net/msg/NetLoadedTrajectoryArray
+```
+
+Both use:
+
+```text
+RELIABLE
+TRANSIENT_LOCAL
+KeepLast(1)
+```
+
+The collision snapshot defines which trajectory IDs are targets.
+
+The net-loaded snapshot defines all current lattice users.
+
+## Multi-mission preservation
+
+For every collision target:
+
+```cpp
+output.trajectory = source.trajectory;
+```
+
+The complete `StaticTrajectory` is copied.
+
+Therefore:
+
+```text
+takeoff
+mission[0]
+mission[1]
+...
+mission[N-1]
+landing
+```
+
+are preserved unchanged in:
+
+```text
+/detected_collision_trajectories
+```
+
+No mission component is selected, merged, reordered or rebuilt.
+
+## Collision semantics
+
+### Shared edge
+
+A target lattice segment is conflicting when another trajectory uses the same:
+
+```text
+edge_id
+```
+
+The full target `NetTrajectorySegment` metadata is copied into
+`GridCollisionSegment`.
+
+### Shared node
+
+A target node is conflicting when another trajectory uses the same:
+
+```text
+node_id
+```
+
+Collision nodes are accumulated in:
+
+```text
+std::map<uint64_t, NodeAccumulator>
+```
+
+so each physical lattice node is emitted only once per target trajectory.
+
+This remains important with partial repetitions.
+
+## Partial repetitions
+
+`a_space_virtual_net_node` deliberately expands partial mission repetitions.
+
+Therefore the same physical lattice edge may appear several times in
+`loaded.segments[]`, with different:
+
+```text
+original_phase_segment_index
+net_segment_index
+```
+
+`collision_detection_node` preserves those occurrence-specific collision
+segments.
+
+However collision nodes are merged by:
+
+```text
+node_id
+```
+
+so repeated visits to the same collision node do not create duplicate
+`GridCollisionNode` entries.
+
+The downstream `deconfliction_manager_node` uses the number of unique
+collision-node IDs for its threshold, so repeated partial mission traversals do
+not inflate the supervision/manual-adjustment classification.
+
+## Multi-mission indices
+
+For MISSION:
+
+```text
+original_phase_segment_index
+```
+
+is the global MISSION source-edge index produced by `a_space_virtual_net_node`
+across all `mission[]` components and repetitions.
+
+Consecutive values are identifiers only.
+
+They do not imply an edge between two independent mission polylines.
+
+Similarly:
+
+```text
+net_segment_index
+```
+
+is an output-stream order index.
+
+Actual lattice connectivity is defined by:
+
+```text
+start_node_id
+end_node_id
+```
+
+## Output
+
+```text
+/detected_collision_trajectories
+collision_detection/msg/DetectedCollisionTrajectoryArray
+```
+
+Each item contains:
+
+```text
+trajectory
+  -> complete multi-mission StaticTrajectory
+
+loaded_on_net
+has_shared_net_space
+conflicting_trajectory_ids[]
+collision_nodes[]
+collision_segments[]
+```
+
+## Missing net-loaded target
+
+If a collision target is present before its retained net-loaded representation
+arrives, it is still published with:
+
+```text
+loaded_on_net = false
+has_shared_net_space = false
+```
+
+When the net snapshot arrives, the detector recomputes automatically.
+
+## RViz
+
+Markers remain:
+
+```text
+RED LINE_LIST
+    conflicting lattice edges
+
+YELLOW SPHERE_LIST
+    conflicting lattice nodes
+
+WHITE TEXT
+    trajectory ID
+    mission count
+    edge count
+    node count
+    conflicting trajectory IDs
+```
+
+The marker geometry is taken directly from the detected lattice resources, so
+independent mission gaps remain gaps.
+
+## Build
+
+Because `StaticTrajectory.msg` changed, this package must be rebuilt after the
+new versions of:
+
+```text
+static_trajectory_manager
+static_trajectory_conflict_manager
+a_space_virtual_net
+```
+
+Example:
+
+```bash
+cd ~/a_space_ws
+
+rm -rf build/static_trajectory_manager \
+       build/static_trajectory_conflict_manager \
+       build/a_space_virtual_net \
+       build/collision_detection
+
+rm -rf install/static_trajectory_manager \
+       install/static_trajectory_conflict_manager \
+       install/a_space_virtual_net \
+       install/collision_detection
+
+colcon build --symlink-install \
+  --packages-up-to collision_detection
+
+source install/setup.bash
+```
+
+## Verification
+
+```bash
+ros2 topic echo /detected_collision_trajectories
+```
+
+For a multi-mission target verify that:
+
+```text
+trajectory.mission
+```
+
+contains every upstream mission component unchanged.

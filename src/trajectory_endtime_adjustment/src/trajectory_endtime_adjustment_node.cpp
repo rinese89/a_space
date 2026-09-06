@@ -241,9 +241,10 @@ private:
 
     RCLCPP_INFO(
       get_logger(),
-      "Stored original priority trajectory '%s' | original_start=%d.%09u | "
-      "original_end=%d.%09u",
+      "Stored original priority trajectory '%s' | missions=%zu | "
+      "original_start=%d.%09u | original_end=%d.%09u",
       trajectory.trajectory_id.c_str(),
+      trajectory.mission.size(),
       trajectory.operation_start_utc.sec,
       trajectory.operation_start_utc.nanosec,
       trajectory.operation_end_utc.sec,
@@ -301,6 +302,9 @@ private:
       static_cast<double>(actual_end_ns - planned_end_ns) /
       static_cast<double>(kNanosecondsPerSecond);
 
+    // StaticTrajectory is copied as a whole. With the multi-mission interface,
+    // this preserves takeoff, every mission[i], landing and all metadata
+    // exactly. This node changes timing fields only.
     StaticTrajectory adjusted = tracked.trajectory;
     adjusted.extra_time = extra_time_s;
     adjusted.operation_end_utc = ns_to_time(actual_end_ns);
@@ -341,6 +345,8 @@ private:
               "Special duration adjustment exceeds int64 UTC range");
     }
 
+    // Preserve the complete ORIGINAL geometry, including every independent
+    // mission[i]. The special adjustment changes only timing metadata.
     StaticTrajectory adjusted = tracked.original;
 
     // IMPORTANT:
@@ -486,8 +492,10 @@ private:
 
           RCLCPP_INFO(
             get_logger(),
-            "Tracking normal active occurrence '%s' | planned_end=%d.%09u",
+            "Tracking normal active occurrence '%s' | missions=%zu | "
+            "planned_end=%d.%09u",
             active_key.c_str(),
+            trajectory.mission.size(),
             trajectory.operation_end_utc.sec,
             trajectory.operation_end_utc.nanosec);
         } else {
@@ -607,7 +615,7 @@ private:
 
     RCLCPP_INFO(
       get_logger(),
-      "Published %zu adjustment(s) to '%s'",
+      "Published %zu multi-mission-preserving adjustment(s) to '%s'",
       output.trajectories.size(),
       adjusted_trajectories_topic_.c_str());
   }

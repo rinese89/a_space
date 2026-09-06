@@ -137,9 +137,6 @@ uas_bringup:
     arm_takeoff_service: arm_takeoff
     follow_waypoints_action: follow_waypoints
 
-    landing_tolerance_xy: 0.30
-    landing_command_retry_s: 1.0
-
     # El nodo genera test/ua_1/odom como frame de los marcadores.
     marker_frame_suffix: odom
     marker_frame: ""
@@ -175,4 +172,16 @@ uas_bringup:
     takeoff:
       tolerance_xy: 0.30
       tolerance_z: 0.20
-  
+
+      # Tras enviar ARM, si el UAS no alcanza el punto final de despegue
+      # dentro de este tiempo, se reinicia la secuencia completa.
+      reach_timeout_s: 15.0
+
+      # Una vez PX4 haya terminado su failsafe y confirme DISARMED en suelo,
+      # espera este tiempo antes de reiniciar desde warm-up=0.
+      ground_settle_s: 1.0
+
+      # 0 = reintentos automáticos ilimitados.
+      # N > 0 = bloquear nuevos reintentos después de N intentos.
+      max_retries: 0
+

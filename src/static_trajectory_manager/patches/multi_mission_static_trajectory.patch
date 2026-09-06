@@ -1,0 +1,555 @@
+--- static_trajectory_manager_node_previous.cpp
++++ src/static_trajectory_manager_node.cpp
+@@ -93,20 +93,23 @@
+   std::string action_name;
+ 
+   SegmentConfig takeoff;
+-  SegmentConfig mission;
++  std::vector<SegmentConfig> missions;
+   SegmentConfig landing;
+ 
+   double goal_tolerance{0.12};
+   double slowdown_radius{0.20};
+-  // Partial repetition: number of mission executions inside one complete
+-  // takeoff -> mission -> landing operation.
++  // Partial repetition: number of repetitions of the ordered mission
++  // collection inside one complete takeoff -> mission[] -> landing operation.
++  //
++  // mission[] elements are independent polylines. No implicit geometric edge
++  // exists between missions[i].back() and missions[i+1].front().
+   uint32_t repetitions{1U};
+ 
+   // Total repetition: period in seconds between complete-operation starts.
+   // 0.0 disables total repetition.
+   double operation_frequency{0.0};
+ 
+-  // Number of complete takeoff -> mission -> landing operations.
++  // Number of complete takeoff -> mission[] -> landing operations.
+   // For periodic trajectories:
+   //   0 => unlimited complete repetitions.
+   //   N => exactly N complete operations.
+@@ -303,28 +306,54 @@
+   return total;
+ }
+ 
+-static void append_polyline(std::vector<Vec3> & target, const std::vector<Vec3> & source)
+-{
+-  if (source.empty()) {
+-    return;
+-  }
+-  target.insert(target.end(), source.begin(), source.end());
+-}
+-
+-static std::vector<Vec3> expanded_operation_points(const TrajectoryConfig & trajectory)
+-{
+-  std::vector<Vec3> points;
+-  const std::size_t reserve_count = trajectory.takeoff.points.size() +
+-    trajectory.landing.points.size() +
+-    trajectory.mission.points.size() * trajectory.repetitions;
+-  points.reserve(reserve_count);
+-
+-  append_polyline(points, trajectory.takeoff.points);
+-  for (uint32_t repetition = 0U; repetition < trajectory.repetitions; ++repetition) {
+-    append_polyline(points, trajectory.mission.points);
+-  }
+-  append_polyline(points, trajectory.landing.points);
+-  return points;
++static double mission_collection_length(
++  const std::vector<SegmentConfig> & missions)
++{
++  double total = 0.0;
++
++  for (const auto & mission : missions) {
++    total += polyline_length(mission.points);
++  }
++
++  return total;
++}
++
++static double operation_geometry_length(
++  const TrajectoryConfig & trajectory)
++{
++  // Each phase/mission component is an independent polyline. In particular,
++  // there is NO implicit edge:
++  //   takeoff.back() -> mission[0].front()
++  //   mission[i].back() -> mission[i+1].front()
++  //   mission.back().back() -> landing.front()
++  //
++  // This is essential for supervised crops, where separate mission[] elements
++  // explicitly represent disconnected collision-free pieces.
++  return
++    polyline_length(trajectory.takeoff.points) +
++    static_cast<double>(trajectory.repetitions) *
++    mission_collection_length(trajectory.missions) +
++    polyline_length(trajectory.landing.points);
++}
++
++static const Vec3 * first_geometry_point(
++  const TrajectoryConfig & trajectory)
++{
++  if (!trajectory.takeoff.points.empty()) {
++    return &trajectory.takeoff.points.front();
++  }
++
++  for (const auto & mission : trajectory.missions) {
++    if (!mission.points.empty()) {
++      return &mission.points.front();
++    }
++  }
++
++  if (!trajectory.landing.points.empty()) {
++    return &trajectory.landing.points.front();
++  }
++
++  return nullptr;
+ }
+ 
+ class StaticTrajectoryManagerNode : public rclcpp::Node
+@@ -480,6 +509,65 @@
+       segment.points.push_back(Vec3{x[i], y[i], z[i]});
+     }
+     return segment;
++  }
++
++  static std::vector<SegmentConfig> parse_missions(
++    const YAML::Node & node,
++    const std::string & context)
++  {
++    if (!node) {
++      throw std::runtime_error(context + " is required");
++    }
++
++    std::vector<SegmentConfig> missions;
++
++    // Backward-compatible shorthand:
++    //
++    // mission:
++    //   x: [...]
++    //   y: [...]
++    //   z: [...]
++    //
++    // is interpreted as exactly one mission component.
++    if (node.IsMap()) {
++      missions.push_back(
++        parse_segment(
++          node,
++          context + "[0]",
++          true));
++
++      return missions;
++    }
++
++    // New representation:
++    //
++    // mission:
++    //   - x: [...]
++    //     y: [...]
++    //     z: [...]
++    //   - x: [...]
++    //     y: [...]
++    //     z: [...]
++    if (!node.IsSequence() || node.size() == 0U) {
++      throw std::runtime_error(
++              context +
++              " must be either one mission map or a non-empty sequence of mission maps");
++    }
++
++    missions.reserve(node.size());
++
++    for (std::size_t i = 0U; i < node.size(); ++i) {
++      const std::string mission_context =
++        context + "[" + std::to_string(i) + "]";
++
++      missions.push_back(
++        parse_segment(
++          node[i],
++          mission_context,
++          true));
++    }
++
++    return missions;
+   }
+ 
+   void load_configuration()
+@@ -556,7 +644,7 @@
+         required_value<std::string>(entry, "operation_start_utc", context));
+ 
+       trajectory.takeoff = parse_segment(entry["takeoff"], context + ".takeoff", false);
+-      trajectory.mission = parse_segment(entry["mission"], context + ".mission", true);
++      trajectory.missions = parse_missions(entry["mission"], context + ".mission");
+       trajectory.landing = parse_segment(entry["landing"], context + ".landing", false);
+ 
+       if (trajectory.trajectory_id.empty() || trajectory.uas_namespace.empty() ||
+@@ -597,8 +685,8 @@
+         throw std::runtime_error("Duplicate trajectory_id: '" + trajectory.trajectory_id + "'");
+       }
+ 
+-      const auto expanded = expanded_operation_points(trajectory);
+-      trajectory.estimated_distance_m = polyline_length(expanded);
++      trajectory.estimated_distance_m =
++        operation_geometry_length(trajectory);
+       trajectory.estimated_duration_s = trajectory.estimated_distance_m / trajectory.average_speed_mps;
+       const int64_t duration_ns = static_cast<int64_t>(
+         std::ceil(trajectory.estimated_duration_s * static_cast<double>(kNanosecondsPerSecond)));
+@@ -861,25 +949,24 @@
+     if (!zone.valid || !zone.zone.enabled || zone.zone.zone_type != FlightZone::INCLUSION) {
+       return false;
+     }
++
+     if (zone.zone.header.frame_id != trajectory.frame_id) {
+       return false;
+     }
+ 
+-    const auto & points = trajectory.mission.points;
+-    for (std::size_t i = 1U; i < points.size(); ++i) {
+-      if (!segment_inside_zone(points[i - 1U], points[i], zone)) {
+-        return false;
+-      }
+-    }
+-
+-    // An open mission repeated more than once implicitly flies from its last
+-    // waypoint back to its first waypoint. That return leg is part of the
+-    // repeated mission and therefore must also remain in the assigned FZ.
+-    if (trajectory.repetitions > 1U &&
+-      !segment_inside_zone(points.back(), points.front(), zone))
+-    {
+-      return false;
+-    }
++    // Every mission[] element is an independent polyline. Validate only the
++    // explicitly represented internal edges. No connector is inferred between
++    // two different mission components.
++    for (const auto & mission : trajectory.missions) {
++      const auto & points = mission.points;
++
++      for (std::size_t i = 1U; i < points.size(); ++i) {
++        if (!segment_inside_zone(points[i - 1U], points[i], zone)) {
++          return false;
++        }
++      }
++    }
++
+     return true;
+   }
+ 
+@@ -960,6 +1047,34 @@
+     return true;
+   }
+ 
++  static bool mission_geometry_matches(
++    const std::vector<SegmentConfig> & stored,
++    const std::vector<TrajectorySegment> & adjusted)
++  {
++    if (stored.size() != adjusted.size()) {
++      return false;
++    }
++
++    for (std::size_t i = 0U; i < stored.size(); ++i) {
++      if (!segment_geometry_matches(stored[i], adjusted[i])) {
++        return false;
++      }
++    }
++
++    return true;
++  }
++
++  static bool mission_array_is_well_formed(
++    const std::vector<TrajectorySegment> & missions)
++  {
++    return std::all_of(
++      missions.begin(),
++      missions.end(),
++      [](const TrajectorySegment & mission) {
++        return adjusted_segment_is_well_formed(mission);
++      });
++  }
++
+   static SegmentConfig segment_config_from_message(const TrajectorySegment & segment)
+   {
+     SegmentConfig output;
+@@ -976,6 +1091,20 @@
+     return output;
+   }
+ 
++  static std::vector<SegmentConfig> mission_configs_from_message(
++    const std::vector<TrajectorySegment> & missions)
++  {
++    std::vector<SegmentConfig> output;
++    output.reserve(missions.size());
++
++    for (const auto & mission : missions) {
++      output.push_back(
++        segment_config_from_message(mission));
++    }
++
++    return output;
++  }
++
+   bool replace_geometry_if_changed(
+     TrajectoryConfig & stored,
+     const StaticTrajectory & adjusted)
+@@ -984,7 +1113,7 @@
+       !segment_geometry_matches(stored.takeoff, adjusted.takeoff);
+ 
+     const bool mission_changed =
+-      !segment_geometry_matches(stored.mission, adjusted.mission);
++      !mission_geometry_matches(stored.missions, adjusted.mission);
+ 
+     const bool landing_changed =
+       !segment_geometry_matches(stored.landing, adjusted.landing);
+@@ -1003,8 +1132,8 @@
+     }
+ 
+     if (mission_changed) {
+-      stored.mission =
+-        segment_config_from_message(adjusted.mission);
++      stored.missions =
++        mission_configs_from_message(adjusted.mission);
+     }
+ 
+     if (landing_changed) {
+@@ -1022,9 +1151,10 @@
+     RCLCPP_INFO(
+       get_logger(),
+       "Replaced stored geometry for adjusted trajectory '%s' | "
+-      "takeoff=%s | mission=%s | landing=%s",
++      "takeoff=%s | mission_count=%zu | mission=%s | landing=%s",
+       stored.trajectory_id.c_str(),
+       takeoff_changed ? "changed" : "unchanged",
++      stored.missions.size(),
+       mission_changed ? "changed" : "unchanged",
+       landing_changed ? "changed" : "unchanged");
+ 
+@@ -1081,7 +1211,7 @@
+ 
+       if (
+         !adjusted_segment_is_well_formed(adjusted.takeoff) ||
+-        !adjusted_segment_is_well_formed(adjusted.mission) ||
++        !mission_array_is_well_formed(adjusted.mission) ||
+         !adjusted_segment_is_well_formed(adjusted.landing))
+       {
+         RCLCPP_WARN(
+@@ -1334,7 +1464,15 @@
+     message.frame_id = trajectory.frame_id;
+     message.action_name = trajectory.action_name;
+     message.takeoff = segment_to_message(trajectory.takeoff);
+-    message.mission = segment_to_message(trajectory.mission);
++
++    message.mission.reserve(
++      trajectory.missions.size());
++
++    for (const auto & mission : trajectory.missions) {
++      message.mission.push_back(
++        segment_to_message(mission));
++    }
++
+     message.landing = segment_to_message(trajectory.landing);
+     message.goal_tolerance = trajectory.goal_tolerance;
+     message.slowdown_radius = trajectory.slowdown_radius;
+@@ -1385,24 +1523,32 @@
+     return color;
+   }
+ 
+-  void add_markers(
+-    const TrajectoryConfig & trajectory, const rclcpp::Time & stamp,
+-    MarkerArray & marker_array) const
+-  {
+-    const auto color = color_from_index(trajectory.input_index);
+-    const auto points = expanded_operation_points(trajectory);
++  static void append_line_strip_marker(
++    const std::vector<Vec3> & points,
++    const std::string & frame_id,
++    const rclcpp::Time & stamp,
++    const std::string & marker_namespace,
++    int marker_id,
++    double line_width,
++    const std_msgs::msg::ColorRGBA & marker_color,
++    MarkerArray & marker_array)
++  {
++    if (points.size() < 2U) {
++      return;
++    }
+ 
+     Marker line;
+-    line.header.frame_id = trajectory.frame_id;
++    line.header.frame_id = frame_id;
+     line.header.stamp = stamp;
+-    line.ns = "static_trajectory/" + trajectory.trajectory_id;
+-    line.id = 0;
++    line.ns = marker_namespace;
++    line.id = marker_id;
+     line.type = Marker::LINE_STRIP;
+     line.action = Marker::ADD;
+     line.pose.orientation.w = 1.0;
+-    line.scale.x = marker_line_width_;
+-    line.color = color;
++    line.scale.x = line_width;
++    line.color = marker_color;
+     line.points.reserve(points.size());
++
+     for (const auto & point : points) {
+       geometry_msgs::msg::Point ros_point;
+       ros_point.x = point.x;
+@@ -1410,43 +1556,125 @@
+       ros_point.z = point.z;
+       line.points.push_back(ros_point);
+     }
+-    marker_array.markers.push_back(std::move(line));
++
++    marker_array.markers.push_back(
++      std::move(line));
++  }
++
++  void add_markers(
++    const TrajectoryConfig & trajectory,
++    const rclcpp::Time & stamp,
++    MarkerArray & marker_array) const
++  {
++    const auto marker_color =
++      color_from_index(
++      trajectory.input_index);
++
++    int marker_id = 0;
++
++    append_line_strip_marker(
++      trajectory.takeoff.points,
++      trajectory.frame_id,
++      stamp,
++      "static_trajectory/" + trajectory.trajectory_id + "/takeoff",
++      marker_id++,
++      marker_line_width_,
++      marker_color,
++      marker_array);
++
++    // Each mission is intentionally rendered as an independent LINE_STRIP.
++    // RViz therefore never draws a fake connector between mission components.
++    for (std::size_t i = 0U;
++      i < trajectory.missions.size();
++      ++i)
++    {
++      append_line_strip_marker(
++        trajectory.missions[i].points,
++        trajectory.frame_id,
++        stamp,
++        "static_trajectory/" + trajectory.trajectory_id +
++        "/mission_" + std::to_string(i),
++        marker_id++,
++        marker_line_width_,
++        marker_color,
++        marker_array);
++    }
++
++    append_line_strip_marker(
++      trajectory.landing.points,
++      trajectory.frame_id,
++      stamp,
++      "static_trajectory/" + trajectory.trajectory_id + "/landing",
++      marker_id++,
++      marker_line_width_,
++      marker_color,
++      marker_array);
+ 
+     Marker text;
+     text.header.frame_id = trajectory.frame_id;
+     text.header.stamp = stamp;
+-    text.ns = "static_trajectory/" + trajectory.trajectory_id;
+-    text.id = 1;
++    text.ns =
++      "static_trajectory/" +
++      trajectory.trajectory_id +
++      "/label";
++    text.id = marker_id++;
+     text.type = Marker::TEXT_VIEW_FACING;
+     text.action = Marker::ADD;
+     text.pose.orientation.w = 1.0;
+     text.scale.z = marker_text_height_;
+-    text.color = color;
++    text.color = marker_color;
+     text.color.a = 1.0F;
+-    if (!points.empty()) {
+-      text.pose.position.x = points.front().x;
+-      text.pose.position.y = points.front().y;
+-      text.pose.position.z = points.front().z + marker_text_height_ * 1.8;
++
++    const Vec3 * first =
++      first_geometry_point(trajectory);
++
++    if (first != nullptr) {
++      text.pose.position.x = first->x;
++      text.pose.position.y = first->y;
++      text.pose.position.z =
++        first->z +
++        marker_text_height_ * 1.8;
+     }
+ 
+     std::ostringstream label;
+-    label << trajectory.trajectory_id << "  P=" << trajectory.priority << "\n"
+-          << "start: " << format_utc_iso8601(trajectory.operation_start_ns) << "\n"
+-          << "end:   " << format_utc_iso8601(trajectory.operation_end_ns) << "\n"
+-          << "mission x" << trajectory.repetitions;
++    label
++      << trajectory.trajectory_id
++      << "  P=" << trajectory.priority << "\n"
++      << "start: "
++      << format_utc_iso8601(
++      trajectory.operation_start_ns) << "\n"
++      << "end:   "
++      << format_utc_iso8601(
++      trajectory.operation_end_ns) << "\n"
++      << "missions="
++      << trajectory.missions.size()
++      << " | partial repetitions="
++      << trajectory.repetitions;
++
+     if (trajectory.operation_frequency > 0.0) {
+-      label << " | full period " << std::fixed << std::setprecision(1)
+-            << trajectory.operation_frequency << " s\n"
+-            << "total repetitions: done=" << trajectory.completed_total_repetitions
+-            << " | remaining=";
++      label
++        << " | full period "
++        << std::fixed
++        << std::setprecision(1)
++        << trajectory.operation_frequency
++        << " s\n"
++        << "total repetitions: done="
++        << trajectory.completed_total_repetitions
++        << " | remaining=";
++
+       if (trajectory.total_repetitions == 0U) {
+         label << "unlimited";
+       } else {
+-        label << remaining_total_repetitions(trajectory);
+-      }
+-    }
++        label <<
++          remaining_total_repetitions(
++          trajectory);
++      }
++    }
++
+     text.text = label.str();
+-    marker_array.markers.push_back(std::move(text));
++
++    marker_array.markers.push_back(
++      std::move(text));
+   }
+ 
+   void publish_valid_snapshot()
+@@ -1498,7 +1726,7 @@
+       if (!mission_inside_zone(trajectory, zone_it->second)) {
+         RCLCPP_DEBUG(
+           get_logger(),
+-          "Unvalidated '%s': mission is not fully inside enabled INCLUSION zone '%s'",
++          "Unvalidated '%s': one or more mission polylines are not fully inside enabled INCLUSION zone '%s'",
+           trajectory.trajectory_id.c_str(), trajectory.flight_zone_id.c_str());
+         unvalidated.push_back(&trajectory);
+         continue;
+@@ -1518,7 +1746,7 @@
+ 
+       // A periodic definition now represents ONE concrete complete occurrence
+       // at a time. /adjusted_trajectories advances start/end to the following
+-      // occurrence after each takeoff -> mission -> landing execution.
++      // occurrence after each takeoff -> mission[] -> landing execution.
+       if (trajectory.operation_frequency > 0.0) {
+         if (trajectory.total_repetition_exhausted) {
+           latest.push_back(&trajectory);

@@ -1,221 +1,254 @@
-# control_manager_pkg — supervision-action version
+# control_manager_pkg 0.3.0 — multi-mission execution
 
-ROS 2 Humble package containing the per-UAS node:
-
-```text
-/<flight_zone>/<uas_namespace>/control_manager_node
-```
-
-This version removes the direct subscription to:
-
-```text
-/active_trajectories
-```
-
-Trajectory acquisition and supervision commands now arrive exclusively through:
-
-```text
-/<flight_zone>/<uas_namespace>/supervision_control
-```
-
-Type:
-
-```text
-flight_zone_supervision/action/SupervisionControl
-```
-
-The action contract is defined in the `flight_zone_supervision` package.
-
-## Why this change
-
-The flight-zone `supervision_node` is now the authority that decides:
-
-- which active trajectory belongs to each UAS;
-- whether that trajectory is supervised or normal;
-- whether the non-supervised counterpart must be paused;
-- when that counterpart may resume.
-
-`control_manager_node` therefore no longer independently reads
-`/active_trajectories`.
-
-## Supervision action commands
-
-### EXECUTE
-
-The goal must contain exactly one:
+Per-UAS ROS 2 Humble control manager adapted to:
 
 ```text
 static_trajectory_manager/msg/StaticTrajectory
 ```
 
-inside:
+with:
 
 ```text
-goal.trajectories.trajectories[]
+TrajectorySegment takeoff
+TrajectorySegment[] mission
+TrajectorySegment landing
 ```
 
-The trajectory must belong to this node's:
+## Main change
+
+The previous control manager assumed:
 
 ```text
-/<flight_zone>/<uas_namespace>
+one mission polyline
 ```
 
-and must pass the same geometry/action/time validation used by the previous
-`/active_trajectories` callback.
-
-The occurrence key remains:
+and expanded:
 
 ```text
-trajectory_id + operation_start_utc
+mission x repetitions
 ```
 
-so duplicate `EXECUTE` commands for the same occurrence are idempotent.
+into one large `mission_path_map_`.
 
-A different occurrence is rejected while this node is busy executing/storing
-another one.
+That is no longer valid because independent `mission[]` components must not be
+concatenated into one artificial polyline.
 
-The action result acknowledges acquisition of the command. It does **not**
-remain open until the complete flight finishes. The actual flight continues
-asynchronously through the existing state machine.
-
-### PAUSE
-
-PAUSE is now supervision-aware.
-
-It can be applied:
+The new execution order is:
 
 ```text
-WAITING_START
-TAKEOFF_REQUEST
-TAKEOFF_RESPONSE
-MISSION_DISPATCH
-MISSION_ACTIVE
+TAKEOFF
+
+repetition 0:
+    mission[0]
+    mission[1]
+    ...
+    mission[N-1]
+
+repetition 1:
+    mission[0]
+    mission[1]
+    ...
+    mission[N-1]
+
+...
+
+LANDING
 ```
 
-as well as idempotently while already paused.
-
-New state:
+Every `mission[i]` is sent as its own:
 
 ```text
-PAUSED_BEFORE_START
-```
-
-If PAUSE is received before takeoff, no takeoff command is sent until RESUME.
-
-If PAUSE arrives while TAKEOFF is already being processed, the takeoff is
-allowed to finish and the UAS remains in HOLD before mission dispatch.
-
-If PAUSE arrives during MISSION_ACTIVE, the existing FollowWaypoints goal is
-canceled and the controller remains in HOLD exactly as in the previous
-implementation.
-
-### Preemptive PAUSE latch
-
-`supervision_node` may send EXECUTE and PAUSE in the same evaluation cycle.
-
-DDS/action request scheduling should not be relied upon to guarantee which
-command reaches the control manager first.
-
-Therefore, if PAUSE arrives while no trajectory is stored:
-
-```text
-PAUSE
-  -> preemptive_pause_latch = true
-```
-
-and the next EXECUTE is acquired directly as:
-
-```text
-PAUSED_BEFORE_START
-```
-
-This makes EXECUTE/PAUSE ordering deterministic from a safety perspective.
-
-### RESUME
-
-RESUME performs:
-
-```text
-PAUSED_BEFORE_START -> WAITING_START
-PAUSED              -> MISSION_DISPATCH
-```
-
-If a mission-action cancellation for PAUSE is already in flight, RESUME is
-queued and the remaining mission is dispatched as soon as cancellation
-finishes.
-
-RESUME also clears a preemptive PAUSE latch if no trajectory has been acquired
-yet.
-
-### STOP
-
-STOP preserves the existing total-stop behavior:
-
-- before takeoff: cancel the occurrence without flight commands;
-- during mission: cancel the FollowWaypoints action;
-- after takeoff/while paused: return toward the landing entry;
-- finally send the landing endpoint through `ArmTakeoff`.
-
-## Supervision-authorized start delay
-
-The original node rejects an operation when:
-
-```text
-now - operation_start_utc > max_start_lateness_s
-```
-
-That remains the default behavior.
-
-However, if supervision intentionally pauses the UAS **before takeoff**, the
-operation may legitimately resume later than the normal lateness limit.
-
-The new state machine records that this delay was supervision-authorized.
-After RESUME, the late start is accepted once and TAKEOFF proceeds.
-
-This avoids turning a deliberate safety pause into a false
-`operation start was missed` failure.
-
-## Existing internal control flow retained
-
-Once EXECUTE has been acquired, the main control sequence is still:
-
-```text
-WAITING_START
-    |
-    v
-TAKEOFF_REQUEST
-    |
-    v
-ArmTakeoff service
-    |
-    v
-MISSION_DISPATCH
-    |
-    v
 controllers_pkg/action/FollowWaypoints
-    |
-    v
-LANDING_REQUEST
-    |
-    v
-ArmTakeoff service
-    |
-    v
-COMPLETED
 ```
 
-Mission repetition expansion, TF transforms, feedback monitoring, path
-deviation detection, return-and-land fallback and completed-occurrence
-deduplication are preserved.
+goal.
+
+## No mission-array flattening
+
+The node never creates:
+
+```text
+mission[0].back() -> mission[1].front()
+```
+
+inside its stored path representation.
+
+`mission_path_map_` now contains only the mission component currently being
+executed.
+
+When `mission[i]` completes, a new FollowWaypoints action is dispatched for
+`mission[i+1]`.
+
+This is also important for path-deviation monitoring: the current vehicle pose
+is compared only against the active mission component, not against a flattened
+union of all mission geometries.
+
+## FollowWaypoints height
+
+`FollowWaypoints` exposes one scalar:
+
+```text
+height
+```
+
+per action.
+
+The previous implementation therefore required the complete mission to have one
+constant Z.
+
+With multi-mission dispatch the rule is now:
+
+```text
+mission[0].z must be constant
+mission[1].z must be constant
+...
+```
+
+but different mission components may use different heights.
+
+Example:
+
+```yaml
+mission:
+  - x: [0.0, 5.0]
+    y: [0.0, 0.0]
+    z: [3.0, 3.0]
+
+  - x: [5.0, 10.0]
+    y: [5.0, 5.0]
+    z: [6.0, 6.0]
+```
+
+is valid.
+
+The first action is sent with:
+
+```text
+height = 3.0
+```
+
+and the second with:
+
+```text
+height = 6.0
+```
+
+A single `mission[i]` with changing Z is still rejected because the current
+FollowWaypoints interface cannot encode it.
+
+## Validation
+
+A received EXECUTE trajectory now requires:
+
+```text
+valid takeoff
+mission.size() >= 1
+every mission[i] valid
+valid landing
+repetitions >= 1
+```
+
+Every mission component needs at least two finite XYZ points.
+
+## Pause / resume
+
+The execution cursor is now:
+
+```text
+current_repetition_
+current_mission_index_
+current_mission_waypoint_
+```
+
+When PAUSE cancels the active FollowWaypoints goal, the node retains all three
+values.
+
+RESUME therefore dispatches:
+
+```text
+the remaining waypoints of the same mission[i]
+```
+
+rather than restarting the whole multi-mission operation.
+
+Once that component succeeds, normal sequencing continues with the following
+mission component.
+
+## Repetitions
+
+`repetitions` applies to the complete ordered mission collection.
+
+For:
+
+```text
+mission.size() = 3
+repetitions = 2
+```
+
+execution is:
+
+```text
+r0/m0
+r0/m1
+r0/m2
+r1/m0
+r1/m1
+r1/m2
+```
+
+Each item above is one independent FollowWaypoints goal.
+
+## Path-deviation monitoring
+
+The old implementation measured deviation against one flattened mission path.
+
+The new implementation stores only the active `mission[i]` in
+`mission_path_map_`.
+
+Therefore:
+
+```text
+distance_to_mission_path()
+```
+
+cannot accidentally use a nearby segment from another mission component and
+cannot construct an artificial line across a gap.
+
+## STOP behavior
+
+STOP semantics are unchanged.
+
+During any mission component:
+
+```text
+cancel current FollowWaypoints
+    ->
+return toward landing entry
+    ->
+landing endpoint through ArmTakeoff
+```
+
+The remaining mission components/repetitions are abandoned.
+
+## Supervised trajectories
+
+`supervision_node` still sends the ORIGINAL complete trajectory to
+`control_manager_node`.
+
+The cropped multi-mission trajectory is used in planning/reservation upstream;
+it is not substituted for the original execution trajectory.
+
+The SupervisionControl EXECUTE transport already contains a complete
+StaticTrajectoryArray, so no action-interface change was required here.
 
 ## State machine
 
-States:
+The high-level states remain:
 
 ```text
 WAITING_TRAJECTORY
 WAITING_START
-PAUSED_BEFORE_START      <-- new
+PAUSED_BEFORE_START
 TAKEOFF_REQUEST
 TAKEOFF_RESPONSE
 MISSION_DISPATCH
@@ -231,78 +264,18 @@ COMPLETED
 FAILED
 ```
 
-## Existing manual service retained
-
-The previous service is intentionally kept:
+`MISSION_DISPATCH`/`MISSION_ACTIVE` now refer to the current pair:
 
 ```text
-/<flight_zone>/<uas_namespace>/trajectory_control
+(repetition, mission_index)
 ```
 
-Type:
-
-```text
-control_manager_pkg/srv/ControlTrajectory
-```
-
-Commands:
-
-```text
-0 = PAUSE
-1 = RESUME
-2 = STOP
-```
-
-It now uses the same pause/resume/stop state-transition helpers as the
-supervision action, so automatic supervision and manual operator control do not
-diverge in behavior.
-
-## Underlying controller APIs
-
-The node still uses:
-
-```text
-/<flight_zone>/<uas_namespace>/arm_takeoff
-controllers_pkg/srv/ArmTakeoff
-```
-
-and:
-
-```text
-/<flight_zone>/<uas_namespace>/follow_waypoints
-controllers_pkg/action/FollowWaypoints
-```
-
-`StaticTrajectory.action_name` is still validated against the per-UAS
-`follow_waypoints` action name.
-
-## Expected integration
-
-```text
-/active_trajectories
-        |
-        v
-/<flight_zone>/supervision_node
-        |
-        | SupervisionControl::EXECUTE
-        | SupervisionControl::PAUSE
-        | SupervisionControl::RESUME
-        v
-/<flight_zone>/<uas>/control_manager_node
-        |
-        +--> ArmTakeoff service
-        |
-        `--> FollowWaypoints action
-```
-
-`control_manager_node` itself has **no `/active_trajectories` subscription**.
+rather than one globally flattened mission.
 
 ## Build
 
-The `flight_zone_supervision` package must be available because it owns the
-`SupervisionControl.action` interface.
-
-From the workspace root:
+Because `StaticTrajectory.msg` changed, rebuild this package against the
+migrated interface chain:
 
 ```bash
 cd ~/a_space_ws
@@ -316,55 +289,22 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-## Launch
+## Useful runtime log
 
-Example:
-
-```bash
-ros2 launch control_manager_pkg control_manager_node.launch.py \
-  flight_zone_id:=inspection_1 \
-  uas_namespace:=ua_ins_1
-```
-
-Expected action server:
+Acquisition now reports:
 
 ```text
-/inspection_1/ua_ins_1/supervision_control
+missions=<N>
+repetitions=<R>
+total_mission_points=<...>
 ```
 
-Check it with:
-
-```bash
-ros2 action info /inspection_1/ua_ins_1/supervision_control
-```
-
-## Direct action test
-
-An EXECUTE goal is normally produced by `supervision_node`.
-
-PAUSE can be tested with:
-
-```bash
-ros2 action send_goal \
-  /inspection_1/ua_ins_1/supervision_control \
-  flight_zone_supervision/action/SupervisionControl \
-  "{command: 1, trajectories: {trajectories: []}, reason: 'test pause'}"
-```
-
-RESUME:
-
-```bash
-ros2 action send_goal \
-  /inspection_1/ua_ins_1/supervision_control \
-  flight_zone_supervision/action/SupervisionControl \
-  "{command: 2, trajectories: {trajectories: []}, reason: 'test resume'}"
-```
-
-The action constants are:
+Each FollowWaypoints action reports:
 
 ```text
-EXECUTE=0
-PAUSE=1
-RESUME=2
-STOP=3
+repetition=<r>
+mission=<i>/<N>
+base_waypoint=<k>
 ```
+
+which makes PAUSE/RESUME and multi-mission sequencing directly traceable.

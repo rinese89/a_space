@@ -1,85 +1,202 @@
-# static_trajectory_manager
+# static_trajectory_manager 0.6.0
 
-Long-term store and validator for static UAS trajectories.
+Breaking message revision: one `StaticTrajectory` can now contain several
+independent mission polylines.
 
-## Repetition model
+## Message change
 
-Two different repetition concepts are deliberately kept separate:
-
-- `repetitions`: **partial repetition**. It repeats only the `mission` segment
-  inside one complete takeoff -> mission -> landing operation.
-- `operation_frequency`: **total repetition period**, in seconds, between
-  complete-operation starts.
-- `total_repetitions`: YAML-only total-operation count:
-  - `0`: unlimited complete repetitions (only valid/useful when
-    `operation_frequency > 0`);
-  - `N > 0`: exactly N complete operations.
-
-`total_repetitions` is intentionally an internal long-term-store property and
-is not added to `StaticTrajectory.msg`.
-
-## Renewal of a periodic trajectory
-
-The manager publishes only one concrete complete occurrence at a time.
-
-When `/adjusted_trajectories` reports that occurrence as completed:
+Previous field:
 
 ```text
-actual_start = adjusted.operation_start_utc
-actual_end   = adjusted.operation_end_utc
-period       = operation_frequency
-
-next_start = actual_start + period
-next_end   = actual_end   + period
+static_trajectory_manager/TrajectorySegment mission
 ```
 
-The adjusted end may represent a positive or negative `extra_time`. Shifting
-both limits by the same period carries the measured duration correction into
-the next occurrence.
+New field:
 
-This also handles an occurrence whose start was delayed by
-`trajectory_server_node`: the adjusted occurrence start is authoritative.
+```text
+static_trajectory_manager/TrajectorySegment[] mission
+```
 
-## Internal counters
+`takeoff` and `landing` remain single `TrajectorySegment` fields.
 
-For each periodic trajectory the node maintains:
+In generated C++:
 
-- `completed_total_repetitions`;
-- remaining complete repetitions.
+```cpp
+trajectory.takeoff
+trajectory.mission[0]
+trajectory.mission[1]
+...
+trajectory.landing
+```
 
-If `total_repetitions == 0`, remaining is reported internally as `unlimited`.
+## Geometry semantics
 
-When a finite periodic trajectory reaches its last complete repetition, it is
-no longer renewed and is moved to `/latest_trajectories` with the actual
-start/end of the last occurrence.
+Every `mission[i]` is an independent continuous polyline.
 
-The counters are runtime state and reset if the node is restarted.
+There is **no implicit geometric segment** between:
 
-## Topics
+```text
+mission[i].back()
+and
+mission[i+1].front()
+```
 
-Subscriptions:
+This is intentional. It allows supervised cropped trajectories such as:
 
-- `/flight_zones`
-- `/adjusted_trajectories`
+```text
+A -> B
 
-Publishers:
+E -> F
+```
 
-- `/requested_static_trajectories`
-- `/unvalidated_trajectories`
-- `/latest_trajectories`
-- `/requested_static_trajectories_markers`
+to remain disconnected instead of becoming the false geometry:
 
-Only requested trajectories receive markers.
+```text
+A -> B -> E -> F
+```
 
-## Duplicate/stale adjustment protection
+### Partial repetitions
 
-Each processed periodic occurrence is keyed internally by its concrete
-`operation_start_utc`. A repeated retained adjustment is ignored. An
-adjustment older than the currently stored occurrence is also ignored.
+`repetitions` applies to the complete mission collection.
+
+For geometric distance:
+
+```text
+distance =
+    length(takeoff)
+  + repetitions * sum(length(mission[i]))
+  + length(landing)
+```
+
+No connector distances are added between independent mission elements.
+
+## YAML
+
+### New multi-mission syntax
+
+Use a YAML sequence:
+
+```yaml
+mission:
+  - x: [3.0, 4.0, 5.0]
+    y: [6.0, 6.0, 6.0]
+    z: [3.0, 3.0, 3.0]
+
+  - x: [8.0, 9.0]
+    y: [6.0, 6.0]
+    z: [3.0, 3.0]
+```
+
+Do **not** repeat `x`, `y`, `z` keys inside one YAML map. Repeated YAML keys do
+not represent several missions.
+
+### Backward-compatible input shorthand
+
+The node still accepts the old YAML form:
+
+```yaml
+mission:
+  x: [3.0, 4.0, 5.0]
+  y: [6.0, 6.0, 6.0]
+  z: [3.0, 3.0, 3.0]
+```
+
+It is converted internally to an array containing one mission.
+
+The ROS message itself is always the new array representation.
+
+## Flight-zone validation
+
+Each mission polyline is validated independently against its assigned
+INCLUSION flight zone.
+
+Only edges explicitly contained inside each mission are checked.
+
+No virtual connector is checked between separate missions.
+
+## `/adjusted_trajectories`
+
+The geometry-update path has also been adapted.
+
+The node now compares and replaces:
+
+```text
+takeoff
+mission[]
+landing
+```
+
+A supervision update can therefore replace one mission with several disconnected
+mission fragments without reducing them to a single artificial polyline.
+
+The existing DDS publisher-GID protection remains unchanged: geometry-only
+heartbeats from the supervision publisher do not advance periodic repetitions,
+while temporal adjustments from another publisher continue through the existing
+periodic logic.
+
+## RViz
+
+TAKEOFF, each `mission[i]`, and LANDING are emitted as separate `LINE_STRIP`
+markers.
+
+This prevents RViz from drawing artificial connections between mission
+components.
+
+## Breaking downstream API
+
+Packages compiled against the previous message will need adaptation.
+
+Old code:
+
+```cpp
+trajectory.mission.x
+trajectory.mission.y
+trajectory.mission.z
+```
+
+New code:
+
+```cpp
+for (const auto & mission : trajectory.mission) {
+  mission.x;
+  mission.y;
+  mission.z;
+}
+```
+
+Likely downstream packages include the static conflict manager, virtual net,
+collision/deconfliction/supervision path, trajectory server and control path.
+They should be migrated one at a time.
 
 ## Build
 
+Because the ROS interface changed, clean every package that directly or
+transitively depends on `static_trajectory_manager` before rebuilding.
+
+At minimum:
+
 ```bash
-colcon build --symlink-install --packages-select static_trajectory_manager
+cd ~/a_space_ws
+
+rm -rf build/static_trajectory_manager
+rm -rf install/static_trajectory_manager
+
+colcon build --symlink-install \
+  --packages-select static_trajectory_manager
+
 source install/setup.bash
+```
+
+After downstream packages are adapted, rebuild the complete dependency chain.
+
+## Inspect the new interface
+
+```bash
+ros2 interface show static_trajectory_manager/msg/StaticTrajectory
+```
+
+The mission field must show:
+
+```text
+static_trajectory_manager/TrajectorySegment[] mission
 ```

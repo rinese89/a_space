@@ -9,6 +9,7 @@
 #include <collision_detection/msg/grid_collision_node.hpp>
 
 #include <deconfliction_manager/msg/cropped_net_node.hpp>
+#include <deconfliction_manager/msg/cropped_net_segment.hpp>
 #include <deconfliction_manager/msg/cropped_net_trajectory.hpp>
 #include <deconfliction_manager/msg/requested_supervision_trajectory.hpp>
 #include <deconfliction_manager/msg/requested_supervision_trajectory_array.hpp>
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -56,6 +58,8 @@ using GridCollisionNode =
 
 using CroppedNetNode =
   deconfliction_manager::msg::CroppedNetNode;
+using CroppedNetSegment =
+  deconfliction_manager::msg::CroppedNetSegment;
 using CroppedNetTrajectory =
   deconfliction_manager::msg::CroppedNetTrajectory;
 using RequestedSupervisionTrajectory =
@@ -77,15 +81,28 @@ struct SupervisionState
   CroppedNetTrajectory cropped;
 };
 
+constexpr uint8_t kTakeoffPhase = 0U;
+constexpr uint8_t kMissionPhase = 1U;
+constexpr uint8_t kLandingPhase = 2U;
+constexpr uint32_t kNoMissionIndex =
+  std::numeric_limits<uint32_t>::max();
+
 struct GeometryEdgeKey
 {
   uint8_t phase{0U};
+  uint32_t mission_index{kNoMissionIndex};
   uint64_t edge_id{0U};
 
   bool operator<(const GeometryEdgeKey & other) const
   {
-    return std::tie(phase, edge_id) <
-           std::tie(other.phase, other.edge_id);
+    return std::tie(
+      phase,
+      mission_index,
+      edge_id) <
+      std::tie(
+      other.phase,
+      other.mission_index,
+      other.edge_id);
   }
 };
 
@@ -93,6 +110,20 @@ struct RetainedNodeAccumulator
 {
   geometry_msgs::msg::Point position;
   std::set<uint8_t> phases;
+  std::set<uint32_t> mission_indices;
+};
+
+struct SegmentOrigin
+{
+  uint32_t mission_index{kNoMissionIndex};
+  uint32_t source_repetition{0U};
+  uint32_t mission_source_segment_index{0U};
+};
+
+struct OrientedRun
+{
+  std::vector<geometry_msgs::msg::Point> points;
+  uint32_t first_net_segment_index{0U};
 };
 
 static std::string join_ids(
@@ -422,6 +453,131 @@ private:
     return ordered;
   }
 
+  static std::size_t trajectory_segment_point_count(
+    const TrajectorySegment & segment)
+  {
+    return
+      std::min(
+      segment.x.size(),
+      std::min(
+        segment.y.size(),
+        segment.z.size()));
+  }
+
+  static uint32_t trajectory_segment_edge_count(
+    const TrajectorySegment & segment)
+  {
+    const std::size_t count =
+      trajectory_segment_point_count(segment);
+
+    if (count < 2U) {
+      return 0U;
+    }
+
+    return
+      static_cast<uint32_t>(
+      count - 1U);
+  }
+
+  static std::vector<uint32_t>
+  mission_source_edge_counts(
+    const StaticTrajectory & trajectory)
+  {
+    std::vector<uint32_t> counts;
+    counts.reserve(
+      trajectory.mission.size());
+
+    for (const auto & mission :
+      trajectory.mission)
+    {
+      counts.push_back(
+        trajectory_segment_edge_count(
+          mission));
+    }
+
+    return counts;
+  }
+
+  static uint32_t mission_cycle_source_edge_count(
+    const std::vector<uint32_t> & counts)
+  {
+    uint64_t total = 0U;
+
+    for (const uint32_t count : counts) {
+      total += count;
+    }
+
+    if (
+      total >
+      static_cast<uint64_t>(
+        std::numeric_limits<uint32_t>::max()))
+    {
+      throw std::runtime_error(
+              "Mission source-edge count exceeds uint32 range");
+    }
+
+    return static_cast<uint32_t>(total);
+  }
+
+  static SegmentOrigin segment_origin(
+    const StaticTrajectory & trajectory,
+    const NetTrajectorySegment & segment)
+  {
+    SegmentOrigin output;
+
+    if (segment.phase != kMissionPhase) {
+      return output;
+    }
+
+    const auto counts =
+      mission_source_edge_counts(
+      trajectory);
+
+    const uint32_t cycle_edge_count =
+      mission_cycle_source_edge_count(
+      counts);
+
+    if (cycle_edge_count == 0U) {
+      return output;
+    }
+
+    output.source_repetition =
+      segment.original_phase_segment_index /
+      cycle_edge_count;
+
+    const uint32_t local_index =
+      segment.original_phase_segment_index %
+      cycle_edge_count;
+
+    uint32_t offset = 0U;
+
+    for (std::size_t mission_index = 0U;
+      mission_index < counts.size();
+      ++mission_index)
+    {
+      const uint32_t count =
+        counts[mission_index];
+
+      if (
+        local_index >= offset &&
+        local_index < offset + count)
+      {
+        output.mission_index =
+          static_cast<uint32_t>(
+          mission_index);
+
+        output.mission_source_segment_index =
+          local_index - offset;
+
+        return output;
+      }
+
+      offset += count;
+    }
+
+    return output;
+  }
+
   static void accumulate_retained_node(
     std::map<
       uint64_t,
@@ -429,6 +585,7 @@ private:
     uint64_t node_id,
     const geometry_msgs::msg::Point & position,
     uint8_t phase,
+    uint32_t mission_index,
     const std::set<uint64_t> & forbidden_nodes)
   {
     if (
@@ -441,6 +598,555 @@ private:
     auto & node = nodes[node_id];
     node.position = position;
     node.phases.insert(phase);
+
+    if (mission_index != kNoMissionIndex) {
+      node.mission_indices.insert(
+        mission_index);
+    }
+  }
+
+  static bool share_node(
+    const NetTrajectorySegment & first,
+    const NetTrajectorySegment & second)
+  {
+    return
+      first.start_node_id ==
+      second.start_node_id ||
+      first.start_node_id ==
+      second.end_node_id ||
+      first.end_node_id ==
+      second.start_node_id ||
+      first.end_node_id ==
+      second.end_node_id;
+  }
+
+  static geometry_msgs::msg::Point
+  trajectory_segment_point(
+    const TrajectorySegment & segment,
+    std::size_t index)
+  {
+    geometry_msgs::msg::Point point;
+    point.x = segment.x[index];
+    point.y = segment.y[index];
+    point.z = segment.z[index];
+    return point;
+  }
+
+  static double squared_distance(
+    const geometry_msgs::msg::Point & first,
+    const geometry_msgs::msg::Point & second)
+  {
+    const double dx =
+      first.x - second.x;
+    const double dy =
+      first.y - second.y;
+    const double dz =
+      first.z - second.z;
+
+    return
+      dx * dx +
+      dy * dy +
+      dz * dz;
+  }
+
+  static double point_to_polyline_parameter(
+    const geometry_msgs::msg::Point & query,
+    const TrajectorySegment & original)
+  {
+    const std::size_t count =
+      trajectory_segment_point_count(
+      original);
+
+    if (count == 0U) {
+      return 0.0;
+    }
+
+    if (count == 1U) {
+      return std::sqrt(
+        squared_distance(
+          query,
+          trajectory_segment_point(
+            original,
+            0U)));
+    }
+
+    double best_distance_sq =
+      std::numeric_limits<double>::infinity();
+    double best_parameter = 0.0;
+    double cumulative = 0.0;
+
+    for (std::size_t index = 1U;
+      index < count;
+      ++index)
+    {
+      const auto start =
+        trajectory_segment_point(
+        original,
+        index - 1U);
+
+      const auto end =
+        trajectory_segment_point(
+        original,
+        index);
+
+      const double vx =
+        end.x - start.x;
+      const double vy =
+        end.y - start.y;
+      const double vz =
+        end.z - start.z;
+
+      const double wx =
+        query.x - start.x;
+      const double wy =
+        query.y - start.y;
+      const double wz =
+        query.z - start.z;
+
+      const double length_sq =
+        vx * vx +
+        vy * vy +
+        vz * vz;
+
+      const double length =
+        std::sqrt(length_sq);
+
+      double ratio = 0.0;
+
+      if (length_sq > 1.0e-12) {
+        ratio =
+          std::clamp(
+          (wx * vx + wy * vy + wz * vz) /
+          length_sq,
+          0.0,
+          1.0);
+      }
+
+      geometry_msgs::msg::Point closest;
+      closest.x =
+        start.x + ratio * vx;
+      closest.y =
+        start.y + ratio * vy;
+      closest.z =
+        start.z + ratio * vz;
+
+      const double distance_sq =
+        squared_distance(
+        query,
+        closest);
+
+      if (distance_sq < best_distance_sq) {
+        best_distance_sq =
+          distance_sq;
+        best_parameter =
+          cumulative +
+          ratio * length;
+      }
+
+      cumulative += length;
+    }
+
+    return best_parameter;
+  }
+
+  static const TrajectorySegment &
+  original_phase_segment(
+    const StaticTrajectory & trajectory,
+    uint8_t phase,
+    uint32_t mission_index)
+  {
+    if (phase == kTakeoffPhase) {
+      return trajectory.takeoff;
+    }
+
+    if (phase == kLandingPhase) {
+      return trajectory.landing;
+    }
+
+    if (
+      phase != kMissionPhase ||
+      mission_index >=
+      trajectory.mission.size())
+    {
+      throw std::runtime_error(
+              "Invalid phase/mission_index while materializing cropped trajectory");
+    }
+
+    return
+      trajectory.mission[
+      mission_index];
+  }
+
+  static OrientedRun orient_run(
+    const std::vector<
+      const CroppedNetSegment *> & run,
+    const TrajectorySegment & original)
+  {
+    OrientedRun output;
+
+    if (
+      run.empty() ||
+      run.front() == nullptr)
+    {
+      return output;
+    }
+
+    output.first_net_segment_index =
+      run.front()->segment.net_segment_index;
+
+    const auto & first =
+      run.front()->segment;
+
+    geometry_msgs::msg::Point first_point;
+    geometry_msgs::msg::Point second_point;
+    uint64_t current_node = 0U;
+
+    if (
+      run.size() >= 2U &&
+      run[1U] != nullptr)
+    {
+      const auto & next =
+        run[1U]->segment;
+
+      const bool start_is_shared =
+        first.start_node_id ==
+        next.start_node_id ||
+        first.start_node_id ==
+        next.end_node_id;
+
+      const bool end_is_shared =
+        first.end_node_id ==
+        next.start_node_id ||
+        first.end_node_id ==
+        next.end_node_id;
+
+      if (
+        start_is_shared &&
+        !end_is_shared)
+      {
+        first_point = first.end;
+        second_point = first.start;
+        current_node =
+          first.start_node_id;
+      } else if (
+        end_is_shared &&
+        !start_is_shared)
+      {
+        first_point = first.start;
+        second_point = first.end;
+        current_node =
+          first.end_node_id;
+      } else {
+        const double start_parameter =
+          point_to_polyline_parameter(
+          first.start,
+          original);
+
+        const double end_parameter =
+          point_to_polyline_parameter(
+          first.end,
+          original);
+
+        if (start_parameter <= end_parameter) {
+          first_point = first.start;
+          second_point = first.end;
+          current_node =
+            first.end_node_id;
+        } else {
+          first_point = first.end;
+          second_point = first.start;
+          current_node =
+            first.start_node_id;
+        }
+      }
+    } else {
+      const double start_parameter =
+        point_to_polyline_parameter(
+        first.start,
+        original);
+
+      const double end_parameter =
+        point_to_polyline_parameter(
+        first.end,
+        original);
+
+      if (start_parameter <= end_parameter) {
+        first_point = first.start;
+        second_point = first.end;
+        current_node =
+          first.end_node_id;
+      } else {
+        first_point = first.end;
+        second_point = first.start;
+        current_node =
+          first.start_node_id;
+      }
+    }
+
+    output.points.push_back(
+      first_point);
+    output.points.push_back(
+      second_point);
+
+    for (std::size_t index = 1U;
+      index < run.size();
+      ++index)
+    {
+      if (run[index] == nullptr) {
+        break;
+      }
+
+      const auto & edge =
+        run[index]->segment;
+
+      geometry_msgs::msg::Point next_point;
+      uint64_t next_node = 0U;
+
+      if (
+        edge.start_node_id ==
+        current_node)
+      {
+        next_point =
+          edge.end;
+        next_node =
+          edge.end_node_id;
+      } else if (
+        edge.end_node_id ==
+        current_node)
+      {
+        next_point =
+          edge.start;
+        next_node =
+          edge.start_node_id;
+      } else {
+        break;
+      }
+
+      output.points.push_back(
+        next_point);
+      current_node = next_node;
+    }
+
+    return output;
+  }
+
+  static TrajectorySegment trajectory_segment_from_points(
+    const std::vector<
+      geometry_msgs::msg::Point> & points)
+  {
+    TrajectorySegment output;
+
+    output.x.reserve(points.size());
+    output.y.reserve(points.size());
+    output.z.reserve(points.size());
+
+    for (const auto & point : points) {
+      output.x.push_back(point.x);
+      output.y.push_back(point.y);
+      output.z.push_back(point.z);
+    }
+
+    return output;
+  }
+
+  static std::vector<
+    std::vector<const CroppedNetSegment *>>
+  continuous_runs(
+    std::vector<
+      const CroppedNetSegment *> ordered)
+  {
+    std::stable_sort(
+      ordered.begin(),
+      ordered.end(),
+      [](
+        const CroppedNetSegment * first,
+        const CroppedNetSegment * second)
+      {
+        return
+          first->segment.net_segment_index <
+          second->segment.net_segment_index;
+      });
+
+    std::vector<
+      std::vector<const CroppedNetSegment *>>
+      runs;
+
+    std::vector<
+      const CroppedNetSegment *> current;
+
+    for (const auto * segment : ordered) {
+      if (segment == nullptr) {
+        continue;
+      }
+
+      if (current.empty()) {
+        current.push_back(segment);
+        continue;
+      }
+
+      const auto * previous =
+        current.back();
+
+      const bool consecutive =
+        previous != nullptr &&
+        segment->segment.net_segment_index ==
+        previous->segment.net_segment_index +
+        1U;
+
+      const bool connected =
+        previous != nullptr &&
+        share_node(
+          previous->segment,
+          segment->segment);
+
+      if (
+        consecutive &&
+        connected)
+      {
+        current.push_back(segment);
+      } else {
+        runs.push_back(current);
+        current.clear();
+        current.push_back(segment);
+      }
+    }
+
+    if (!current.empty()) {
+      runs.push_back(current);
+    }
+
+    return runs;
+  }
+
+  static bool materialize_cropped_static_trajectory(
+    CroppedNetTrajectory & crop,
+    const StaticTrajectory & original)
+  {
+    StaticTrajectory adjusted =
+      original;
+
+    adjusted.takeoff =
+      TrajectorySegment{};
+    adjusted.mission.clear();
+    adjusted.landing =
+      TrajectorySegment{};
+
+    std::map<
+      uint32_t,
+      std::vector<
+        const CroppedNetSegment *>>
+      mission_segments;
+
+    std::vector<
+      const CroppedNetSegment *>
+      takeoff_segments;
+
+    std::vector<
+      const CroppedNetSegment *>
+      landing_segments;
+
+    for (const auto & wrapped :
+      crop.retained_segments)
+    {
+      const auto & segment =
+        wrapped.segment;
+
+      if (segment.phase ==
+        kTakeoffPhase)
+      {
+        takeoff_segments.push_back(
+          &wrapped);
+      } else if (
+        segment.phase ==
+        kLandingPhase)
+      {
+        landing_segments.push_back(
+          &wrapped);
+      } else if (
+        segment.phase ==
+        kMissionPhase &&
+        wrapped.mission_index !=
+        kNoMissionIndex)
+      {
+        mission_segments[
+          wrapped.mission_index].
+          push_back(&wrapped);
+      }
+    }
+
+    const auto takeoff_runs =
+      continuous_runs(
+      takeoff_segments);
+
+    if (takeoff_runs.size() > 1U) {
+      return false;
+    }
+
+    if (!takeoff_runs.empty()) {
+      const OrientedRun run =
+        orient_run(
+        takeoff_runs.front(),
+        original.takeoff);
+
+      adjusted.takeoff =
+        trajectory_segment_from_points(
+        run.points);
+    }
+
+    for (const auto & [mission_index, segments] :
+      mission_segments)
+    {
+      if (
+        mission_index >=
+        original.mission.size())
+      {
+        return false;
+      }
+
+      const auto runs =
+        continuous_runs(
+        segments);
+
+      for (const auto & run_segments :
+        runs)
+      {
+        const OrientedRun run =
+          orient_run(
+          run_segments,
+          original.mission[
+            mission_index]);
+
+        if (run.points.size() >= 2U) {
+          adjusted.mission.push_back(
+            trajectory_segment_from_points(
+              run.points));
+        }
+      }
+    }
+
+    const auto landing_runs =
+      continuous_runs(
+      landing_segments);
+
+    if (landing_runs.size() > 1U) {
+      return false;
+    }
+
+    if (!landing_runs.empty()) {
+      const OrientedRun run =
+        orient_run(
+        landing_runs.front(),
+        original.landing);
+
+      adjusted.landing =
+        trajectory_segment_from_points(
+        run.points);
+    }
+
+    crop.trajectory =
+      std::move(adjusted);
+
+    return true;
   }
 
   CroppedNetTrajectory build_crop(
@@ -454,6 +1160,8 @@ private:
       detected.trajectory.frame_id;
     output.source_repetitions =
       detected.trajectory.repetitions;
+    output.trajectory =
+      detected.trajectory;
 
     const std::set<uint64_t> forbidden_nodes =
       unique_collision_node_ids(detected);
@@ -482,6 +1190,7 @@ private:
 
     if (loaded_it == loaded_by_id_.end()) {
       output.complete = false;
+      output.trajectory_materialized = false;
 
       RCLCPP_WARN_THROTTLE(
         get_logger(),
@@ -502,9 +1211,9 @@ private:
     const auto ordered =
       ordered_net_segments(loaded);
 
-    // Geometry is represented only once. Repeated partial mission operations
-    // can generate the same virtual-net edge several times; (phase, edge_id)
-    // is retained only on its first occurrence.
+    // Partial repetitions are collapsed, but different mission components are
+    // deliberately NOT merged even when they traverse the same virtual-net
+    // edge. This preserves the new mission[] semantics.
     std::set<GeometryEdgeKey>
       emitted_geometry;
 
@@ -521,11 +1230,22 @@ private:
         continue;
       }
 
+      const SegmentOrigin origin =
+        segment_origin(
+        detected.trajectory,
+        *segment);
+
+      const uint32_t mission_index =
+        segment->phase == kMissionPhase ?
+        origin.mission_index :
+        kNoMissionIndex;
+
       accumulate_retained_node(
         retained_nodes,
         segment->start_node_id,
         segment->start,
         segment->phase,
+        mission_index,
         forbidden_nodes);
 
       accumulate_retained_node(
@@ -533,6 +1253,7 @@ private:
         segment->end_node_id,
         segment->end,
         segment->phase,
+        mission_index,
         forbidden_nodes);
 
       const bool endpoint_collision =
@@ -551,6 +1272,7 @@ private:
 
       const GeometryEdgeKey key{
         segment->phase,
+        mission_index,
         segment->edge_id};
 
       if (
@@ -567,15 +1289,23 @@ private:
 
       emitted_geometry.insert(key);
 
+      CroppedNetSegment wrapped;
+      wrapped.mission_index =
+        mission_index;
+      wrapped.source_repetition =
+        origin.source_repetition;
+      wrapped.segment =
+        *segment;
+
       if (remove) {
         output.removed_segments.push_back(
-          *segment);
+          std::move(wrapped));
 
         removed_edge_ids.insert(
           segment->edge_id);
       } else {
         output.retained_segments.push_back(
-          *segment);
+          std::move(wrapped));
       }
     }
 
@@ -595,9 +1325,28 @@ private:
       node.phases.assign(
         accumulated.phases.begin(),
         accumulated.phases.end());
+      node.mission_indices.assign(
+        accumulated.mission_indices.begin(),
+        accumulated.mission_indices.end());
 
       output.retained_nodes.push_back(
         std::move(node));
+    }
+
+    output.trajectory_materialized =
+      materialize_cropped_static_trajectory(
+      output,
+      detected.trajectory);
+
+    if (!output.trajectory_materialized) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        3000,
+        "Crop for '%s' is valid on the virtual net but cannot be represented "
+        "exactly by StaticTrajectory: TAKEOFF or LANDING contains more than "
+        "one disconnected retained run",
+        detected.trajectory.trajectory_id.c_str());
     }
 
     return output;
@@ -634,17 +1383,21 @@ private:
         state.detected = detected;
         state.cropped = build_crop(detected);
 
-        requested_supervision_state_[
-          trajectory.trajectory_id] =
-          std::move(state);
-
         RCLCPP_DEBUG(
           get_logger(),
           "Trajectory '%s' -> REQUESTED_SUPERVISION | "
-          "unique_collision_nodes=%zu < %d",
+          "missions=%zu | unique_collision_nodes=%zu < %d | "
+          "cropped_missions=%zu | materialized=%s",
           trajectory.trajectory_id.c_str(),
+          trajectory.mission.size(),
           node_count,
-          collision_node_threshold_);
+          collision_node_threshold_,
+          state.cropped.trajectory.mission.size(),
+          state.cropped.trajectory_materialized ? "true" : "false");
+
+        requested_supervision_state_[
+          trajectory.trajectory_id] =
+          std::move(state);
       } else {
         manual_adjustment_state_[
           trajectory.trajectory_id] =
@@ -853,54 +1606,79 @@ private:
       });
   }
 
-  static std::vector<
-    geometry_msgs::msg::Point>
-  expanded_points(
-    const StaticTrajectory & trajectory)
+  static void append_segment_line_list(
+    Marker & marker,
+    const TrajectorySegment & segment)
   {
-    std::vector<
-      geometry_msgs::msg::Point> output;
+    const std::size_t count =
+      trajectory_segment_point_count(
+      segment);
 
-    const auto append =
-      [&output](
-      const TrajectorySegment & segment)
-      {
-        const std::size_t count =
-          std::min(
-          segment.x.size(),
-          std::min(
-            segment.y.size(),
-            segment.z.size()));
-
-        for (std::size_t index = 0U;
-          index < count;
-          ++index)
-        {
-          geometry_msgs::msg::Point point;
-          point.x = segment.x[index];
-          point.y = segment.y[index];
-          point.z = segment.z[index];
-          output.push_back(point);
-        }
-      };
-
-    append(trajectory.takeoff);
-
-    const uint32_t repetitions =
-      std::max<uint32_t>(
-      1U,
-      trajectory.repetitions);
-
-    for (uint32_t repetition = 0U;
-      repetition < repetitions;
-      ++repetition)
-    {
-      append(trajectory.mission);
+    if (count < 2U) {
+      return;
     }
 
-    append(trajectory.landing);
+    for (std::size_t index = 1U;
+      index < count;
+      ++index)
+    {
+      marker.points.push_back(
+        trajectory_segment_point(
+          segment,
+          index - 1U));
 
-    return output;
+      marker.points.push_back(
+        trajectory_segment_point(
+          segment,
+          index));
+    }
+  }
+
+  static bool first_trajectory_point(
+    const StaticTrajectory & trajectory,
+    geometry_msgs::msg::Point & point)
+  {
+    if (
+      trajectory_segment_point_count(
+        trajectory.takeoff) > 0U)
+    {
+      point =
+        trajectory_segment_point(
+        trajectory.takeoff,
+        0U);
+
+      return true;
+    }
+
+    for (const auto & mission :
+      trajectory.mission)
+    {
+      if (
+        trajectory_segment_point_count(
+          mission) > 0U)
+      {
+        point =
+          trajectory_segment_point(
+          mission,
+          0U);
+
+        return true;
+      }
+    }
+
+    if (
+      trajectory_segment_point_count(
+        trajectory.landing) > 0U)
+    {
+      point =
+        trajectory_segment_point(
+        trajectory.landing,
+        0U);
+
+      return true;
+    }
+
+    return false;
   }
 
   void add_supervision_markers(
@@ -932,13 +1710,13 @@ private:
       crop.color.b = 0.95F;
       crop.color.a = 1.00F;
 
-      for (const auto & segment :
+      for (const auto & wrapped :
         state.cropped.retained_segments)
       {
         crop.points.push_back(
-          segment.start);
+          wrapped.segment.start);
         crop.points.push_back(
-          segment.end);
+          wrapped.segment.end);
       }
 
       markers.markers.push_back(
@@ -1015,34 +1793,52 @@ private:
     const auto & trajectory =
       detected.trajectory;
 
-    const auto points =
-      expanded_points(trajectory);
+    Marker line;
+    line.header.stamp = now();
+    line.header.frame_id =
+      trajectory.frame_id;
+    line.ns =
+      "deconfliction/manual_adjustment/" +
+      trajectory.trajectory_id;
+    line.id = marker_id++;
+    line.type = Marker::LINE_LIST;
+    line.action = Marker::ADD;
+    line.pose.orientation.w = 1.0;
+    line.scale.x =
+      manual_line_width_;
+    line.color.r = 1.00F;
+    line.color.g = 0.12F;
+    line.color.b = 0.08F;
+    line.color.a = 1.00F;
 
-    if (points.size() >= 2U) {
-      Marker line;
-      line.header.stamp = now();
-      line.header.frame_id =
-        trajectory.frame_id;
-      line.ns =
-        "deconfliction/manual_adjustment/" +
-        trajectory.trajectory_id;
-      line.id = marker_id++;
-      line.type = Marker::LINE_STRIP;
-      line.action = Marker::ADD;
-      line.pose.orientation.w = 1.0;
-      line.scale.x =
-        manual_line_width_;
-      line.color.r = 1.00F;
-      line.color.g = 0.12F;
-      line.color.b = 0.08F;
-      line.color.a = 1.00F;
-      line.points = points;
+    append_segment_line_list(
+      line,
+      trajectory.takeoff);
 
+    for (const auto & mission :
+      trajectory.mission)
+    {
+      append_segment_line_list(
+        line,
+        mission);
+    }
+
+    append_segment_line_list(
+      line,
+      trajectory.landing);
+
+    if (!line.points.empty()) {
       markers.markers.push_back(
         std::move(line));
     }
 
-    if (!points.empty()) {
+    geometry_msgs::msg::Point label_point;
+
+    if (
+      first_trajectory_point(
+        trajectory,
+        label_point))
+    {
       Marker text;
       text.header.stamp = now();
       text.header.frame_id =
@@ -1054,7 +1850,8 @@ private:
       text.type = Marker::TEXT_VIEW_FACING;
       text.action = Marker::ADD;
       text.pose.orientation.w = 1.0;
-      text.pose.position = points.front();
+      text.pose.position =
+        label_point;
       text.pose.position.z +=
         manual_text_height_ * 1.5;
       text.scale.z =
@@ -1065,7 +1862,10 @@ private:
       text.color.a = 1.00F;
       text.text =
         "MANUAL | " +
-        trajectory.trajectory_id;
+        trajectory.trajectory_id +
+        " | missions=" +
+        std::to_string(
+        trajectory.mission.size());
 
       markers.markers.push_back(
         std::move(text));

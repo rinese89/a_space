@@ -1,5 +1,8 @@
-# Collision trajectory enriched with the exact virtual-net resources shared with
+# Collision trajectory enriched with exact virtual-net resources shared with
 # other loaded trajectories.
+#
+# `trajectory` is the complete multi-mission StaticTrajectory. This node does
+# not modify takeoff, mission[] or landing.
 
 static_trajectory_manager/StaticTrajectory trajectory
 

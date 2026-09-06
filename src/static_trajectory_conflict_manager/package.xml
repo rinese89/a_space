@@ -2,11 +2,10 @@
 <package format="3">
   <name>static_trajectory_conflict_manager</name>
   <version>0.4.0</version>
+
   <description>
-    Simplified first-stage static trajectory classifier for A-space. It stores
-    only collision-free trajectories as the comparison set, stops at the first
-    spatial collision, and publishes authoritative available/collision
-    snapshots without detailed collision evidence.
+    Static trajectory conflict manager adapted to multi-mission
+    static_trajectory_manager/StaticTrajectory messages.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>

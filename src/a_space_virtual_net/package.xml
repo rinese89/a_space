@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>a_space_virtual_net</name>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <description>
-    Persistent Cartesian A-space virtual net. Projects available and collision
-    static trajectories onto lattice edges and publishes each trajectory
-    segmented by the virtual net with deterministic node and edge identifiers.
+    Persistent Cartesian A-space virtual net adapted to multi-mission static
+    trajectories. Projects each independent mission polyline onto lattice
+    edges without creating artificial connections between mission components.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>

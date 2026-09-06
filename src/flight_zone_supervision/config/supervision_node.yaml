@@ -7,9 +7,16 @@
     zone_status_suffix: zone_status
     control_action_suffix: supervision_control
 
+    # Activation gate:
+    # UAS-to-UAS safety-distance supervision remains dormant until the UAS
+    # executing the supervised trajectory is at most this distance from ANY
+    # stored collision segment. Once armed for a pair it remains latched until
+    # that pair disappears.
+    collision_monitor_activation_distance_m: 3.0
+
     # Phase 1:
-    # Normal PAUSE/RESUME supervision is applied to the UAS executing the
-    # supervised trajectory.
+    # Once the activation gate has armed, normal PAUSE/RESUME supervision is
+    # applied using the UAS-to-UAS safety distance below.
     security_distance_m: 3.0
     use_3d_distance: true
     zone_status_timeout_s: 2.0

@@ -1,10 +1,14 @@
-# One virtual-net node retained by the cropped supervision geometry.
-# Nodes are geometry-only and therefore appear once even if partial mission
-# repetitions visit the same lattice node more than once.
+# One non-collision virtual-net node retained by the crop.
+# The physical node is emitted once even when partial repetitions visit it
+# several times.
 
 uint64 node_id
 geometry_msgs/Point position
 
-# Phases in which this node was used by the original net-loaded trajectory.
+# Phases in which this node occurs.
 # 0=TAKEOFF, 1=MISSION, 2=LANDING.
 uint8[] phases
+
+# Original mission[] components in which this node occurs.
+# TAKEOFF/LANDING do not add a mission index here.
+uint32[] mission_indices

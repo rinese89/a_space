@@ -19,6 +19,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CroppedNetNode.msg"
+  "msg/CroppedNetSegment.msg"
   "msg/CroppedNetTrajectory.msg"
   "msg/RequestedSupervisionTrajectory.msg"
   "msg/RequestedSupervisionTrajectoryArray.msg"
@@ -27,6 +28,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     std_msgs
     collision_detection
     a_space_virtual_net
+    static_trajectory_manager
 )
 
 add_executable(

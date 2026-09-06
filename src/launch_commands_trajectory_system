@@ -1,0 +1,24 @@
+ros2 launch aspace_bringup_pkg port_environment.launch.py
+
+ros2 launch a_space_virtual_net a_space_virtual_net.launch.py
+
+ros2 launch static_trajectory_manager static_trajectory_manager.launch.py
+
+ros2 launch static_trajectory_conflict_manager static_trajectory_conflict_manager.launch.py
+
+ros2 launch collision_detection collision_detection.launch.py
+
+ros2 launch deconfliction_manager deconfliction_manager.launch.py
+
+ros2 launch supervision_trajectory_manager supervision_trajectory_manager.launch.py
+
+ros2 launch trajectory_server_pkg trajectory_server.launch.py
+
+ros2 launch trajectory_endtime_adjustment trajectory_endtime_adjustment.launch.py
+
+ros2 launch flight_zone_supervision supervision_node.launch.py flight_zone_id:=inspection_1
+
+
+ros2 launch uas_control_system_bringup_pkg uas_control_system_bringup.launch.py ua_id:=ua_ins_1 flight_zone_id:=inspection_1
+
+ros2 launch uas_control_system_bringup_pkg uas_control_system_bringup.launch.py ua_id:=ua_ins_2 flight_zone_id:=inspection_1

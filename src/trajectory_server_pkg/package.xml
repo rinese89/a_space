@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>trajectory_server_pkg</name>
-  <version>0.7.0</version>
-  <description>Runtime trajectory activation server with supervision-aware cropped trajectories and separated non-priority adjustment output.</description>
+  <version>0.9.0</version>
+  <description>Runtime multi-mission trajectory activation server with supervision-aware arbitration and guarded ARM-to-DISARM completion for takeoff retries.</description>
   <maintainer email="maintainer@example.com">A-space</maintainer>
   <license>Apache-2.0</license>
 

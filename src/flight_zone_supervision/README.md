@@ -1,252 +1,162 @@
-# flight_zone_supervision 0.3.0
+# flight_zone_supervision 0.4.0
 
-Per-flight-zone supervision node:
+Per-flight-zone runtime supervision adapted to multi-mission
+`StaticTrajectory` and proximity-triggered safety supervision.
 
-```text
-/<flight_zone>/supervision_node
-```
+## Activation rule
 
-## Inputs
+The UAS-to-UAS safety-distance state machine no longer starts as soon as a
+supervised/non-supervised pair is active.
 
-```text
-/available_static_trajectories
-  static_trajectory_manager/msg/StaticTrajectoryArray
-
-/supervised_trajectories
-  collision_detection/msg/DetectedCollisionTrajectoryArray
-
-/active_trajectories
-  static_trajectory_manager/msg/StaticTrajectoryArray
-```
-
-The node dynamically creates:
-
-```text
-/<flight_zone>/<uas>/zone_status
-  flight_zone_msgs/msg/VehicleZoneStatus
-```
-
-subscriptions and:
-
-```text
-/<flight_zone>/<uas>/supervision_control
-  flight_zone_supervision/action/SupervisionControl
-```
-
-action clients for UAS participating in supervised conflicts.
-
-## EXECUTE behavior
-
-Normal active trajectory:
-
-```text
-/active_trajectories
-  -> EXECUTE the active StaticTrajectory
-```
-
-Supervised active trajectory:
-
-```text
-/active_trajectories contains the cropped trajectory
-/supervised_trajectories contains the original DetectedCollisionTrajectory
-  -> EXECUTE the ORIGINAL complete StaticTrajectory
-```
-
-The cropped geometry remains a planning reservation. The per-UAS
-`control_manager_node` receives the full original trajectory.
-
-# Two-stage deconfliction
-
-For a pair:
-
-```text
-S = supervised active trajectory
-N = non-supervised active conflicting trajectory
-```
-
-the control sequence is now explicit.
-
-## Phase 1 — primary supervision of S
-
-On pair creation:
-
-```text
-PAUSE S
-```
-
-Then the usual distance rule applies:
-
-```text
-distance(S,N) <= security_distance_m
-  -> PAUSE S
-
-distance(S,N) > security_distance_m
-  -> RESUME S
-```
-
-When S is paused at/below the security threshold, the node measures whether the
-separation is actually improving.
-
-The implementation defines "the primary measure is effective" as:
-
-```text
-distance increases by >= distance_progress_epsilon_m
-within distance_progress_timeout_s
-```
-
-Defaults:
+It starts only when the UAS executing the supervised trajectory is at most:
 
 ```yaml
-distance_progress_timeout_s: 0.5
-distance_progress_epsilon_m: 0.05
+collision_monitor_activation_distance_m: 2.0
 ```
 
-If the separation does not improve, the node escalates.
+from at least one ORIGINAL collision segment contained in
+`/supervised_trajectories`.
 
-## Phase 2 — hold N and clear S
+The distance uses the existing `use_3d_distance` option.
 
-Escalation is strictly sequenced:
+### Collision segments only
 
-```text
-PAUSE N
-wait for action acknowledgement
-RESUME S
-```
-
-S remains paused until the PAUSE request for N has been positively accepted.
-N then remains paused while S clears the collision region.
-
-S is then allowed to continue through the original collision section.
-
-The node calculates the minimum distance from the current `zone_status.position`
-of S to all original:
+The activation calculation uses only:
 
 ```text
-collision_nodes[]
 collision_segments[]
 ```
 
-stored in `/supervised_trajectories`.
+and deliberately ignores `collision_nodes[]`.
 
-The counterpart N remains paused until:
+The later collision-clearance calculation remains unchanged and still uses the
+complete collision region: nodes plus segments.
+
+## Latched activation
+
+Activation is stored in `PairState`:
 
 ```text
-distance(S, all collision geometry)
-  > collision_exit_distance_m + collision_exit_hysteresis_m
+safety_monitoring_active
+activation_segment_distance_m
 ```
 
-Defaults:
+Once the distance threshold is crossed, safety supervision remains active for
+that trajectory pair until the pair disappears. Moving back above 2 m does not
+deactivate it.
+
+## Before activation
+
+```text
+supervised pair active
+        |
+        v
+distance(supervised UAS, closest collision segment)
+        |
+        +-- > 2.0 m --> monitor only
+        |              no pair PAUSE/RESUME
+        |              no UAS-to-UAS safety check
+        |
+        +-- <= 2.0 m --> ARM safety supervision
+```
+
+## After activation
+
+The existing two-stage state machine is preserved:
+
+```text
+ARM
+ |
+ v
+initial PAUSE cycle for supervised UAS
+ |
+ v
+UAS-to-UAS distance check
+ |
+ +-- d > security_distance_m
+ |      -> supervised UAS may RESUME
+ |
+ +-- d <= security_distance_m
+        -> supervised UAS PAUSED
+        -> check whether separation improves
+        |
+        +-- improves
+        |      -> continue primary supervision
+        |
+        +-- does not improve
+               -> PAUSE counterpart
+               -> wait for positive PAUSE acknowledgement
+               -> RESUME supervised UAS
+               -> hold counterpart
+               -> release counterpart after collision clearance
+```
+
+`collision_monitor_activation_distance_m` and `security_distance_m` are
+independent thresholds.
+
+## Frame requirement
+
+The activation distance is evaluated only when the supervised UAS
+`VehicleZoneStatus.header.frame_id` matches the collision trajectory
+`frame_id`.
+
+A mismatch leaves the proximity gate unarmed and emits a throttled warning.
+
+## Multi-mission adaptation
+
+`StaticTrajectory` now contains:
+
+```text
+TrajectorySegment[] mission
+```
+
+The action path already transports the complete multi-mission trajectory by
+copy, so the ORIGINAL supervised trajectory is still executed without
+conversion.
+
+Active trajectory RViz markers were updated from a single `LINE_STRIP` to
+`LINE_LIST` built from the internal edges of:
+
+```text
+takeoff
+mission[0]
+mission[1]
+...
+mission[N-1]
+landing
+```
+
+No artificial line is drawn between independent mission components.
+
+## Diagnostic marker
+
+Pair labels now expose:
+
+```text
+safety=WAITING
+segment_d=<distance>
+```
+
+before activation and:
+
+```text
+safety=ARMED
+```
+
+after activation.
+
+## Parameters
 
 ```yaml
-collision_exit_distance_m: 1.0
-collision_exit_hysteresis_m: 0.20
-```
-
-Once S has left the collision section:
-
-```text
-RESUME N
-```
-
-and the pair enters `CLEARED`.
-
-## Pair state machine
-
-```text
-PRIMARY_SUPERVISED_CONTROL
-        |
-        | separation does not improve
-        v
-WAITING_COUNTERPART_PAUSE
-        |
-        | PAUSE(N) action accepted
-        v
-COUNTERPART_HELD_FOR_CLEARANCE
-        |
-        | S entered and then exited collision geometry
-        v
-CLEARED
-```
-
-### PRIMARY_SUPERVISED_CONTROL
-Controlled UAS: `S`.
-
-### COUNTERPART_HELD_FOR_CLEARANCE
-Commands:
-
-```text
-N -> PAUSE
-S -> RESUME
-```
-
-### CLEARED
-Commands:
-
-```text
-S -> RESUME
-N -> RESUME
-```
-
-The pair remains cleared until one of the trajectories disappears from
-`/active_trajectories`.
-
-## Fail-safe behavior
-
-### Phase 1
-Missing/stale `zone_status` or incompatible frames:
-
-```text
-S remains PAUSED
-```
-
-### Phase 2
-Missing/stale status, collision-frame mismatch, or no usable collision
-nodes/segments:
-
-```text
-N remains PAUSED
-S remains released
-```
-
-The node never resumes N unless it can geometrically verify that S has cleared
-the original collision section.
-
-## Multiple pairs
-
-Control requests are aggregated across all active pairs. `PAUSE` dominates
-`RESUME`.
-
-## RViz
-
-Relative topic:
-
-```text
-supervision_markers
-```
-
-Pair labels show:
-
-```text
-PRIMARY_SUPERVISED_CONTROL
-WAITING_COUNTERPART_PAUSE
-COUNTERPART_HELD_FOR_CLEARANCE
-CLEARED
-```
-
-## Main parameters
-
-```yaml
+collision_monitor_activation_distance_m: 2.0
 security_distance_m: 1.0
 use_3d_distance: true
-zone_status_timeout_s: 2.0
 
 distance_progress_timeout_s: 0.5
 distance_progress_epsilon_m: 0.05
 
 collision_exit_distance_m: 1.0
 collision_exit_hysteresis_m: 0.20
-
-evaluation_period_ms: 100
 ```
 
 ## Build
@@ -263,9 +173,14 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-## Launch
+## Runtime check
 
-```bash
-ros2 launch flight_zone_supervision supervision_node.launch.py \
-  flight_zone_id:=inspection_1
+Before the supervised UAS reaches 2 m from a collision segment, this pair
+should not generate safety PAUSE/RESUME commands.
+
+At activation the node logs:
+
+```text
+Safety-distance monitoring ARMED ...
+distance_to_collision_segment=... <= 2.000 m
 ```
