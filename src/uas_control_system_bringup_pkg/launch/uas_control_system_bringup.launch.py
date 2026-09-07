@@ -94,6 +94,89 @@ def _resolve_uas_identity(ua_id_arg: str) -> Tuple[str, str, int]:
     return uas_namespace, namespace_prefix, numeric_id
 
 
+def _controller_takeoff_settings(
+    source_path: str,
+) -> Dict[str, Any]:
+    """Return effective TAKEOFF-retry settings used by control_waypoints."""
+    data = _load_yaml(source_path)
+    root = _root_uas_bringup(data, source_path)
+
+    controller_cfg = root.get("control_waypoints", {}) or {}
+    if not isinstance(controller_cfg, dict):
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene 'control_waypoints' inválido."
+        )
+
+    takeoff_cfg = controller_cfg.get("takeoff", {}) or {}
+    if not isinstance(takeoff_cfg, dict):
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene 'control_waypoints.takeoff' inválido."
+        )
+
+    # These defaults intentionally match the current controllers_pkg launch.
+    return {
+        "reach_timeout_s": float(
+            takeoff_cfg.get("reach_timeout_s", 15.0)
+        ),
+        "arm_retry_period_s": float(
+            takeoff_cfg.get("arm_retry_period_s", 2.0)
+        ),
+        "ground_settle_s": float(
+            takeoff_cfg.get("ground_settle_s", 1.0)
+        ),
+        "max_retries": int(
+            takeoff_cfg.get("max_retries", 0)
+        ),
+    }
+
+
+def _control_manager_settings(
+    source_path: str,
+) -> Dict[str, Any]:
+    """Read the current standalone control_manager ROS-parameter YAML."""
+    data = _load_yaml(source_path)
+
+    wildcard = data.get("/**", {}) or {}
+    if not isinstance(wildcard, dict):
+        raise RuntimeError(
+            f"El YAML '{source_path}' debe contener la clave '/**'."
+        )
+
+    params = wildcard.get("ros__parameters", {}) or {}
+    if not isinstance(params, dict):
+        raise RuntimeError(
+            f"El YAML '{source_path}' debe contener '/**/ros__parameters'."
+        )
+
+    # Defaults match control_manager_pkg 0.3.x multi-mission configuration.
+    return {
+        "retry_period_ms": int(
+            params.get("retry_period_ms", 500)
+        ),
+        "max_start_lateness_s": float(
+            params.get("max_start_lateness_s", 5.0)
+        ),
+        "supervision_action_suffix": str(
+            params.get(
+                "supervision_action_suffix",
+                "supervision_control",
+            )
+        ),
+        "arm_takeoff_service_suffix": str(
+            params.get(
+                "arm_takeoff_service_suffix",
+                "arm_takeoff",
+            )
+        ),
+        "follow_waypoints_action_suffix": str(
+            params.get(
+                "follow_waypoints_action_suffix",
+                "follow_waypoints",
+            )
+        ),
+    }
+
+
 def _write_runtime_yaml(data: Dict[str, Any], stem: str) -> str:
     runtime_dir = Path(tempfile.gettempdir()) / "uas_control_system_bringup_pkg"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -161,6 +244,13 @@ def _launch_setup(context, *_args, **_kwargs):
         "control_manager_config_file"
     ).perform(context)
 
+    controller_takeoff = _controller_takeoff_settings(
+        controller_config_source
+    )
+    control_manager_settings = _control_manager_settings(
+        control_manager_config
+    )
+
     ros_namespace = f"{flight_zone_id}/{uas_namespace}"
     px4_dds_namespace = ros_namespace.replace("/", "_")
 
@@ -206,7 +296,13 @@ def _launch_setup(context, *_args, **_kwargs):
                 f"ROS namespace='/{ros_namespace}' | "
                 f"PX4 DDS namespace='/{px4_dds_namespace}' | "
                 "micro_ros_agent=EXTERNAL | ros_gz_bridge=EXTERNAL | "
-                "control_manager_input=SupervisionControl action"
+                "control_manager_input=SupervisionControl action | "
+                "mission_execution=multi_mission | "
+                f"takeoff_reach_timeout={controller_takeoff['reach_timeout_s']:.2f}s | "
+                f"arm_retry_period={controller_takeoff['arm_retry_period_s']:.2f}s | "
+                f"ground_settle={controller_takeoff['ground_settle_s']:.2f}s | "
+                f"takeoff_max_retries={controller_takeoff['max_retries']} | "
+                f"control_manager_retry={control_manager_settings['retry_period_ms']}ms"
             )
         ),
         IncludeLaunchDescription(
@@ -220,6 +316,11 @@ def _launch_setup(context, *_args, **_kwargs):
                 "flight_zone_id": flight_zone_id,
             }.items(),
         ),
+        # controllers_pkg current behavior:
+        # - TAKEOFF endpoint timeout starts only after PX4 confirms ARMED.
+        # - ARM is retried periodically when PX4 rejects it.
+        # - OFFBOARD-loss recovery waits passively for PX4 landing/DISARMED.
+        # - FollowWaypoints is accepted only from HOLD.
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(control_waypoints_launch),
             launch_arguments={
@@ -229,12 +330,15 @@ def _launch_setup(context, *_args, **_kwargs):
                 "flight_zone_id": flight_zone_id,
             }.items(),
         ),
-        # control_manager_node no longer subscribes to /active_trajectories.
-        # It exposes:
+        # control_manager_node current A-space contract:
+        # - does not subscribe directly to /active_trajectories;
+        # - receives EXECUTE / PAUSE / RESUME / STOP through SupervisionControl;
+        # - executes StaticTrajectory.mission[] component-by-component;
+        # - repeats the complete mission[] collection according to repetitions;
+        # - retries FollowWaypoints until control_waypoints reaches HOLD.
+        #
+        # Action server:
         #   /<flight_zone>/<uas_namespace>/supervision_control
-        # using flight_zone_supervision/action/SupervisionControl.
-        # The flight-zone supervision node is responsible for forwarding
-        # EXECUTE / PAUSE / RESUME / STOP commands to this action server.
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(control_manager_launch),
             launch_arguments={
@@ -281,14 +385,21 @@ def generate_launch_description():
                 default_value=os.path.join(
                     package_share, "config", "controller_waypoints.yaml"
                 ),
-                description="Configuración base para control_waypoints.launch.py.",
+                description=(
+                    "Configuración base para control_waypoints.launch.py. "
+                    "Incluye TAKEOFF retry: reach_timeout_s, "
+                    "arm_retry_period_s, ground_settle_s y max_retries."
+                ),
             ),
             DeclareLaunchArgument(
                 "control_manager_config_file",
                 default_value=os.path.join(
-                    package_share, "config", "control_manager_node.yaml"
+                    package_share, "config", "control_manager.yaml"
                 ),
-                description="Configuración del control_manager_node.",
+                description=(
+                    "Configuración actual del control_manager_node "
+                    "(multi-mission + SupervisionControl)."
+                ),
             ),
             OpaqueFunction(function=_launch_setup),
         ]

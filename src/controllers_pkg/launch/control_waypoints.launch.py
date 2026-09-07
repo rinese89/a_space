@@ -331,6 +331,12 @@ def _launch_setup(context, *_args, **_kwargs):
                 15.0,
             )
         ),
+        "takeoff_arm_retry_period_s": float(
+            takeoff_cfg.get(
+                "arm_retry_period_s",
+                2.0,
+            )
+        ),
         "takeoff_ground_settle_s": float(
             takeoff_cfg.get(
                 "ground_settle_s",

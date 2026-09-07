@@ -158,6 +158,13 @@ public:
         takeoff_reach_timeout_s_ = this->declare_parameter<double>(
             "takeoff_reach_timeout_s", 15.0);
 
+        // Sending ARM is only a request. If PX4 rejects it because health or
+        // preflight checks are not ready, keep OFFBOARD startup alive and
+        // retry ARM periodically. The endpoint timeout starts only after
+        // VehicleStatus confirms ARMING_STATE_ARMED.
+        takeoff_arm_retry_period_s_ = this->declare_parameter<double>(
+            "takeoff_arm_retry_period_s", 2.0);
+
         // Once PX4 has completed the failsafe descent and reports DISARMED,
         // keep the node passive for this short settling time before starting
         // a completely new warm-up -> OFFBOARD -> ARM -> TAKEOFF sequence.
@@ -424,6 +431,7 @@ private:
             takeoff_tolerance_xy_ <= 0.0 ||
             takeoff_tolerance_z_ <= 0.0 ||
             takeoff_reach_timeout_s_ <= 0.0 ||
+            takeoff_arm_retry_period_s_ <= 0.0 ||
             takeoff_ground_settle_s_ < 0.0 ||
             takeoff_max_retries_ < 0 ||
             landing_tolerance_xy_ <= 0.0 ||
@@ -1237,6 +1245,9 @@ private:
         takeoff_attempt_timer_active_ = false;
         takeoff_offboard_seen_ = false;
         takeoff_armed_seen_ = false;
+        takeoff_arm_request_count_ = 0U;
+        takeoff_last_arm_request_at_ =
+            std::chrono::steady_clock::time_point{};
     }
 
     void reset_takeoff_retry_state_for_new_request()
@@ -1441,22 +1452,50 @@ private:
                 takeoff_retry_count_);
         }
 
-        if (warmup_counter_ == 100 && !arm_command_sent_) {
-            // VEHICLE_CMD_COMPONENT_ARM_DISARM = 400 | param1=1 arm
-            send_vehicle_command(400, 1.0f);
-            arm_command_sent_ = true;
+        // ------------------------------------------------------------
+        // ARM REQUEST / CONFIRMATION
+        // ------------------------------------------------------------
+        // The command is retried while PX4 remains unarmed. Merely sending ARM
+        // must never start the takeoff endpoint timeout.
+        if (
+            warmup_counter_ >= 100 &&
+            !takeoff_armed_seen_)
+        {
+            bool arm_retry_due =
+                !arm_command_sent_;
 
-            takeoff_attempt_started_at_ =
-                steady_now;
-            takeoff_attempt_timer_active_ = true;
+            if (
+                arm_command_sent_ &&
+                takeoff_last_arm_request_at_ !=
+                std::chrono::steady_clock::time_point{})
+            {
+                const double since_last_arm_s =
+                    std::chrono::duration<double>(
+                        steady_now -
+                        takeoff_last_arm_request_at_).count();
 
-            RCLCPP_INFO(
-                this->get_logger(),
-                "[%s] ARM request sent | takeoff retry=%u | "
-                "reach_timeout=%.2f s",
-                namespace_path_.c_str(),
-                takeoff_retry_count_,
-                takeoff_reach_timeout_s_);
+                arm_retry_due =
+                    since_last_arm_s >=
+                    takeoff_arm_retry_period_s_;
+            }
+
+            if (arm_retry_due) {
+                // VEHICLE_CMD_COMPONENT_ARM_DISARM = 400 | param1=1 arm
+                send_vehicle_command(400, 1.0f);
+
+                arm_command_sent_ = true;
+                takeoff_last_arm_request_at_ =
+                    steady_now;
+                ++takeoff_arm_request_count_;
+
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "[%s] ARM request #%u sent | takeoff retry=%u | "
+                    "waiting for PX4 ARMING_STATE_ARMED",
+                    namespace_path_.c_str(),
+                    takeoff_arm_request_count_,
+                    takeoff_retry_count_);
+            }
         }
 
         // Track whether PX4 actually entered the expected startup states.
@@ -1474,7 +1513,21 @@ private:
                 px4_msgs::msg::VehicleStatus::
                 ARMING_STATE_ARMED)
             {
-                takeoff_armed_seen_ = true;
+                if (!takeoff_armed_seen_) {
+                    takeoff_armed_seen_ = true;
+                    takeoff_attempt_started_at_ =
+                        steady_now;
+                    takeoff_attempt_timer_active_ = true;
+
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "[%s] PX4 ARM confirmed | takeoff retry=%u | "
+                        "ARM requests=%u | endpoint timeout starts now (%.2f s)",
+                        namespace_path_.c_str(),
+                        takeoff_retry_count_,
+                        takeoff_arm_request_count_,
+                        takeoff_reach_timeout_s_);
+                }
             }
         }
 
@@ -1492,7 +1545,11 @@ private:
         const bool z_reached =
             err_z <= takeoff_tolerance_z_;
 
-        if (xy_reached && z_reached) {
+        if (
+            takeoff_armed_seen_ &&
+            xy_reached &&
+            z_reached)
+        {
             control_state_ =
                 ControlState::HOLD;
             takeoff_attempt_timer_active_ = false;
@@ -1516,7 +1573,6 @@ private:
         // observed at least once. This prevents interpreting the normal warm-up
         // period before OFFBOARD engagement as a failure.
         if (
-            arm_command_sent_ &&
             takeoff_offboard_seen_ &&
             has_vehicle_status_ &&
             nav_state_ !=
@@ -1533,7 +1589,6 @@ private:
         // landing/disarm. Enter the same passive recovery state; the next tick
         // can immediately begin the ground-settle confirmation.
         if (
-            arm_command_sent_ &&
             takeoff_armed_seen_ &&
             has_vehicle_status_ &&
             arming_state_ ==
@@ -1549,7 +1604,10 @@ private:
         // observed cleanly (for example because CPU starvation delayed status
         // processing as well), stop OFFBOARD streaming intentionally and let
         // PX4 execute the same configured failsafe.
-        if (takeoff_attempt_timer_active_) {
+        if (
+            takeoff_armed_seen_ &&
+            takeoff_attempt_timer_active_)
+        {
             const double elapsed_s =
                 std::chrono::duration<double>(
                     steady_now -
@@ -1562,16 +1620,19 @@ private:
             }
         }
 
-        if (!arm_command_sent_) {
+        if (!takeoff_armed_seen_) {
             RCLCPP_INFO_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
                 1000,
                 "[%s] TAKEOFF startup | retry=%u | warmup=%d | "
-                "waiting for OFFBOARD/ARM",
+                "offboard_seen=%s | waiting for ARM confirmation | "
+                "arm_requests=%u",
                 namespace_path_.c_str(),
                 takeoff_retry_count_,
-                warmup_counter_);
+                warmup_counter_,
+                takeoff_offboard_seen_ ? "true" : "false",
+                takeoff_arm_request_count_);
             return;
         }
 
@@ -1725,6 +1786,7 @@ private:
     // Automatic restart of the complete startup sequence when OFFBOARD is
     // lost or the requested takeoff endpoint is not reached after ARM.
     double takeoff_reach_timeout_s_{15.0};
+    double takeoff_arm_retry_period_s_{2.0};
     double takeoff_ground_settle_s_{1.0};
     int takeoff_max_retries_{0};  // 0 = unlimited
 
@@ -1736,6 +1798,9 @@ private:
     // OFFBOARD-loss event from the normal startup period.
     bool takeoff_offboard_seen_{false};
     bool takeoff_armed_seen_{false};
+
+    uint32_t takeoff_arm_request_count_{0U};
+    std::chrono::steady_clock::time_point takeoff_last_arm_request_at_{};
 
     // During TAKEOFF_RECOVERY_WAIT no OFFBOARD/setpoint publications are made.
     // PX4 DISARMED is treated as authoritative completion of the failsafe

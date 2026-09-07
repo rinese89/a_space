@@ -175,7 +175,12 @@ uas_bringup:
 
       # Tras enviar ARM, si el UAS no alcanza el punto final de despegue
       # dentro de este tiempo, se reinicia la secuencia completa.
-      reach_timeout_s: 15.0
+      # Empieza únicamente cuando PX4 confirma ARMING_STATE_ARMED.
+      reach_timeout_s: 30.0
+
+      # Si PX4 rechaza ARM por health/preflight, el nodo mantiene el startup
+      # OFFBOARD y vuelve a solicitar ARM con este periodo.
+      arm_retry_period_s: 2.0
 
       # Una vez PX4 haya terminado su failsafe y confirme DISARMED en suelo,
       # espera este tiempo antes de reiniciar desde warm-up=0.

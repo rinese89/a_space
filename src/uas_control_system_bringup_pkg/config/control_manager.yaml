@@ -1,0 +1,40 @@
+/**:
+  ros__parameters:
+    # Per-UAS controller interfaces. The node itself runs in:
+    #   /<flight_zone>/<uas_namespace>
+    odom_frame_suffix: odom
+    arm_takeoff_service_suffix: arm_takeoff
+    follow_waypoints_action_suffix: follow_waypoints
+
+    # Action server used by /<flight_zone>/supervision_node.
+    # Absolute example:
+    #   /inspection_1/ua_ins_1/supervision_control
+    supervision_action_suffix: supervision_control
+
+    # Manual/operator compatibility service retained.
+    operator_service_suffix: trajectory_control
+
+    tick_period_ms: 100
+    retry_period_ms: 500
+
+    service_wait_timeout_ms: 50
+    action_wait_timeout_ms: 50
+    service_yaw_rad: 0.0
+
+    # Normal late acquisition still fails after this margin.
+    # Exception: a trajectory explicitly PAUSED by supervision before takeoff
+    # may resume later without being rejected for supervised lateness.
+    max_start_lateness_s: 5.0
+
+    transform_timeout_s: 0.20
+
+    max_path_deviation_m: 1.0
+    deviation_grace_period_s: 1.0
+    deviation_hold_time_s: 0.75
+
+    max_completed_keys: 128
+
+# Multi-mission execution is driven entirely by StaticTrajectory.mission[].
+# No additional parameter is required:
+#   mission[0] -> mission[1] -> ... -> mission[N-1]
+# and that complete collection is repeated `repetitions` times.

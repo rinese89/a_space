@@ -26,7 +26,7 @@ static_trajectory_manager:
       total_repetitions: 3
 
       average_speed_mps: 2.0
-      operation_start_utc: "2026-09-06T22:48:00Z"
+      operation_start_utc: "2026-09-07T19:18:00Z"
 
       takeoff:
         x: [3.0, 3.0]
@@ -39,7 +39,7 @@ static_trajectory_manager:
       # of mission[1].
       mission:
         - x: [3.0, 3.0, 12.0, 12.0, 3.0, 3.0]
-          y: [3.0, 7.0, 7.0, 10.0, 10.0, 3.0]
+          y: [3.0, 7.0, 7.0, 6.0, 6.0, 3.0]
           z: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
 
       landing:
@@ -64,7 +64,7 @@ static_trajectory_manager:
       total_repetitions: 3
 
       average_speed_mps: 2.0
-      operation_start_utc: "2026-09-06T22:48:00Z"
+      operation_start_utc: "2026-09-07T19:18:00Z"
 
       takeoff:
         x: [6.0, 6.0]
