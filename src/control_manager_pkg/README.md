@@ -1,287 +1,153 @@
-# control_manager_pkg 0.3.0 — multi-mission execution
+# control_manager_pkg 0.4.0
 
-Per-UAS ROS 2 Humble control manager adapted to:
+Per-UAS control manager for the current A-space supervision workflow.
 
-```text
-static_trajectory_manager/msg/StaticTrajectory
-```
+## SupervisionControl contract
 
-with:
-
-```text
-TrajectorySegment takeoff
-TrajectorySegment[] mission
-TrajectorySegment landing
-```
-
-## Main change
-
-The previous control manager assumed:
+This package must be built against the updated `flight_zone_supervision`
+interface:
 
 ```text
-one mission polyline
+EXECUTE = 0
+PAUSE   = 1
+RESUME  = 2
+ELEVATE = 3
+DESCEND = 4
+STOP    = 5
 ```
 
-and expanded:
+The operator compatibility service `ControlTrajectory.srv` is unchanged.
+
+## Vertical deconfliction behavior
+
+The normal mission cursor is:
 
 ```text
-mission x repetitions
+repetition
+mission_index
+mission_waypoint
 ```
 
-into one large `mission_path_map_`.
+PAUSE cancels the current mission `FollowWaypoints` goal and preserves that
+cursor.
 
-That is no longer valid because independent `mission[]` components must not be
-concatenated into one artificial polyline.
+### ELEVATE = 3
 
-The new execution order is:
+ELEVATE is valid only for an acquired mission that is paused or whose PAUSE is
+already being processed.
+
+If ELEVATE arrives while PAUSE cancellation is still in flight, it is accepted
+and queued.
+
+Once the controller reaches HOLD:
+
+1. The control manager captures the latest real mission feedback position in
+   the trajectory/map frame.
+2. That position becomes the stored vertical reference.
+3. A one-point auxiliary `FollowWaypoints` goal is sent:
 
 ```text
-TAKEOFF
-
-repetition 0:
-    mission[0]
-    mission[1]
-    ...
-    mission[N-1]
-
-repetition 1:
-    mission[0]
-    mission[1]
-    ...
-    mission[N-1]
-
-...
-
-LANDING
+x = reference.x
+y = reference.y
+z = reference.z + vertical_grid_step_m
 ```
 
-Every `mission[i]` is sent as its own:
+4. `repetition`, `mission_index` and `mission_waypoint` are not modified.
+5. After the auxiliary goal succeeds, the state returns to PAUSED and the UAS
+   stays elevated.
 
-```text
-controllers_pkg/action/FollowWaypoints
-```
-
-goal.
-
-## No mission-array flattening
-
-The node never creates:
-
-```text
-mission[0].back() -> mission[1].front()
-```
-
-inside its stored path representation.
-
-`mission_path_map_` now contains only the mission component currently being
-executed.
-
-When `mission[i]` completes, a new FollowWaypoints action is dispatched for
-`mission[i+1]`.
-
-This is also important for path-deviation monitoring: the current vehicle pose
-is compared only against the active mission component, not against a flattened
-union of all mission geometries.
-
-## FollowWaypoints height
-
-`FollowWaypoints` exposes one scalar:
-
-```text
-height
-```
-
-per action.
-
-The previous implementation therefore required the complete mission to have one
-constant Z.
-
-With multi-mission dispatch the rule is now:
-
-```text
-mission[0].z must be constant
-mission[1].z must be constant
-...
-```
-
-but different mission components may use different heights.
-
-Example:
+Default:
 
 ```yaml
-mission:
-  - x: [0.0, 5.0]
-    y: [0.0, 0.0]
-    z: [3.0, 3.0]
-
-  - x: [5.0, 10.0]
-    y: [5.0, 5.0]
-    z: [6.0, 6.0]
+vertical_grid_step_m: 1.0
 ```
 
-is valid.
+### DESCEND = 4
 
-The first action is sent with:
+DESCEND uses the same stored reference:
 
 ```text
-height = 3.0
+x = reference.x
+y = reference.y
+z = reference.z
 ```
 
-and the second with:
+The mission remains paused.
 
-```text
-height = 6.0
-```
+After successful descent:
 
-A single `mission[i]` with changing Z is still rejected because the current
-FollowWaypoints interface cannot encode it.
+- the stored vertical reference is cleared;
+- the mission cursor is still unchanged;
+- state returns to PAUSED.
 
-## Validation
-
-A received EXECUTE trajectory now requires:
-
-```text
-valid takeoff
-mission.size() >= 1
-every mission[i] valid
-valid landing
-repetitions >= 1
-```
-
-Every mission component needs at least two finite XYZ points.
-
-## Pause / resume
-
-The execution cursor is now:
-
-```text
-current_repetition_
-current_mission_index_
-current_mission_waypoint_
-```
-
-When PAUSE cancels the active FollowWaypoints goal, the node retains all three
-values.
-
-RESUME therefore dispatches:
-
-```text
-the remaining waypoints of the same mission[i]
-```
-
-rather than restarting the whole multi-mission operation.
-
-Once that component succeeds, normal sequencing continues with the following
-mission component.
-
-## Repetitions
-
-`repetitions` applies to the complete ordered mission collection.
-
-For:
-
-```text
-mission.size() = 3
-repetitions = 2
-```
-
-execution is:
-
-```text
-r0/m0
-r0/m1
-r0/m2
-r1/m0
-r1/m1
-r1/m2
-```
-
-Each item above is one independent FollowWaypoints goal.
-
-## Path-deviation monitoring
-
-The old implementation measured deviation against one flattened mission path.
-
-The new implementation stores only the active `mission[i]` in
-`mission_path_map_`.
-
-Therefore:
-
-```text
-distance_to_mission_path()
-```
-
-cannot accidentally use a nearby segment from another mission component and
-cannot construct an artificial line across a gap.
-
-## STOP behavior
-
-STOP semantics are unchanged.
-
-During any mission component:
-
-```text
-cancel current FollowWaypoints
-    ->
-return toward landing entry
-    ->
-landing endpoint through ArmTakeoff
-```
-
-The remaining mission components/repetitions are abandoned.
-
-## Supervised trajectories
-
-`supervision_node` still sends the ORIGINAL complete trajectory to
-`control_manager_node`.
-
-The cropped multi-mission trajectory is used in planning/reservation upstream;
-it is not substituted for the original execution trajectory.
-
-The SupervisionControl EXECUTE transport already contains a complete
-StaticTrajectoryArray, so no action-interface change was required here.
+If RESUME arrives while DESCEND is still completing, it is accepted and queued.
+The remaining mission is dispatched only after DESCEND finishes successfully.
 
 ## State machine
 
-The high-level states remain:
-
 ```text
-WAITING_TRAJECTORY
-WAITING_START
-PAUSED_BEFORE_START
-TAKEOFF_REQUEST
-TAKEOFF_RESPONSE
-MISSION_DISPATCH
 MISSION_ACTIVE
+     |
+     | PAUSE
+     v
 PAUSE_CANCELING
+     |
+     | ELEVATE may already be queued here
+     v
 PAUSED
-STOP_CANCELING
-RETURN_DISPATCH
-RETURN_ACTIVE
-LANDING_REQUEST
-LANDING_RESPONSE
-COMPLETED
-FAILED
+     |
+     | ELEVATE=3
+     v
+VERTICAL_ELEVATE_DISPATCH
+     |
+     v
+VERTICAL_ELEVATE_ACTIVE
+     |
+     | success
+     v
+PAUSED (elevated)
+     |
+     | DESCEND=4
+     v
+VERTICAL_DESCEND_DISPATCH
+     |
+     v
+VERTICAL_DESCEND_ACTIVE
+     |
+     | success
+     v
+PAUSED
+     |
+     | RESUME=2
+     v
+MISSION_DISPATCH
+     |
+     v
+MISSION_ACTIVE
 ```
 
-`MISSION_DISPATCH`/`MISSION_ACTIVE` now refer to the current pair:
+## Important safeguards
 
-```text
-(repetition, mission_index)
-```
+- `RESUME` is rejected while the UAS is elevated or elevating.
+- `RESUME` may be queued while DESCEND is active.
+- ELEVATE/DESCEND auxiliary actions do not advance mission indices.
+- An auxiliary action rejected because the lower controller is not yet in HOLD
+  is retried using `retry_period_ms`.
+- Failed vertical auxiliary actions are retried while the mission remains
+  paused.
+- STOP can cancel an active vertical auxiliary goal and proceeds to the
+  existing return-and-land sequence.
 
-rather than one globally flattened mission.
+## Build order
 
-## Build
-
-Because `StaticTrajectory.msg` changed, rebuild this package against the
-migrated interface chain:
+Because `SupervisionControl.action` changed, rebuild the interface package and
+this package together:
 
 ```bash
 cd ~/a_space_ws
 
-rm -rf build/control_manager_pkg
-rm -rf install/control_manager_pkg
+rm -rf build/flight_zone_supervision install/flight_zone_supervision
+rm -rf build/control_manager_pkg install/control_manager_pkg
 
 colcon build --symlink-install \
   --packages-up-to control_manager_pkg
@@ -289,22 +155,6 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-## Useful runtime log
-
-Acquisition now reports:
-
-```text
-missions=<N>
-repetitions=<R>
-total_mission_points=<...>
-```
-
-Each FollowWaypoints action reports:
-
-```text
-repetition=<r>
-mission=<i>/<N>
-base_waypoint=<k>
-```
-
-which makes PAUSE/RESUME and multi-mission sequencing directly traceable.
+`--packages-up-to control_manager_pkg` should rebuild the updated
+`flight_zone_supervision` dependency first when both packages are present in
+the workspace.

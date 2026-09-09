@@ -16,7 +16,7 @@ deconfliction_manager_node:
     #
     # nodes < threshold  -> requested supervision
     # nodes >= threshold -> manual adjustment
-    collision_node_threshold: 10
+    collision_node_threshold: 30
 
     publish_period_ms: 1000
 

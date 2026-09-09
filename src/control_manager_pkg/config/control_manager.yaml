@@ -28,6 +28,12 @@
 
     transform_timeout_s: 0.20
 
+    # Vertical A-space grid step used by SupervisionControl:
+    #   ELEVATE=3 -> +1 grid unit
+    #   DESCEND=4 -> return to stored pre-elevation position
+    # Keep this aligned with flight_zone_supervision/supervision_node.yaml.
+    vertical_grid_step_m: 1.0
+
     max_path_deviation_m: 1.0
     deviation_grace_period_s: 1.0
     deviation_hold_time_s: 0.75

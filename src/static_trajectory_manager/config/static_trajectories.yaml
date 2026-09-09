@@ -26,7 +26,7 @@ static_trajectory_manager:
       total_repetitions: 3
 
       average_speed_mps: 2.0
-      operation_start_utc: "2026-09-07T19:18:00Z"
+      operation_start_utc: "2026-09-08T23:13:00Z"
 
       takeoff:
         x: [3.0, 3.0]
@@ -38,9 +38,9 @@ static_trajectory_manager:
       # There is NO implicit edge between the end of mission[0] and the start
       # of mission[1].
       mission:
-        - x: [3.0, 3.0, 12.0, 12.0, 3.0, 3.0]
-          y: [3.0, 7.0, 7.0, 6.0, 6.0, 3.0]
-          z: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+        - x: [3.0, 2.0, 2.0, 5.0, 5.0, 2.0, 2.0, 5.0, 5.0, 4.0, 4.0, 3.0]
+          y: [3.0, 3.0, 5.0, 5.0, 7.0, 7.0, 8.0, 8.0, 10.0, 10.0, 3.0, 3.0]
+          z: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
 
       landing:
         x: [3.0, 3.0]
@@ -64,7 +64,7 @@ static_trajectory_manager:
       total_repetitions: 3
 
       average_speed_mps: 2.0
-      operation_start_utc: "2026-09-07T19:18:00Z"
+      operation_start_utc: "2026-09-08T23:13:00Z"
 
       takeoff:
         x: [6.0, 6.0]
@@ -77,9 +77,9 @@ static_trajectory_manager:
       # of mission[1].
       mission:
 
-        - x: [6.0, 6.0, 12.0, 12.0, 6.0]
-          y: [3.0, 7.0, 7.0, 3.0, 3.0]
-          z: [5.0, 5.0, 5.0, 5.0, 5.0]
+        - x: [6.0, 7.0, 7.0, 5.0, 5.0, 8.0, 8.0, 5.0, 5.0, 4.0, 4.0, 6.0]
+          y: [3.0, 3.0, 5.0, 5.0, 7.0, 7.0, 8.0, 8.0, 10.0, 10.0, 3.0, 3.0]
+          z: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
 
       landing:
         x: [6.0, 6.0]

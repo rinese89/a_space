@@ -1,0 +1,13 @@
+std_msgs/Header header
+
+uint32 first_ua_id
+string first_uas_namespace
+string first_flight_zone_id
+geometry_msgs/Point first_position
+
+uint32 second_ua_id
+string second_uas_namespace
+string second_flight_zone_id
+geometry_msgs/Point second_position
+
+float64 distance_xy_m

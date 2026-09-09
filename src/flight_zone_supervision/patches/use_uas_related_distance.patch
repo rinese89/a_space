@@ -1,0 +1,3819 @@
+--- src/supervision_node_previous.cpp
++++ src/supervision_node.cpp
+@@ -6,7 +6,8 @@
+ #include <collision_detection/msg/detected_collision_trajectory.hpp>
+ #include <collision_detection/msg/detected_collision_trajectory_array.hpp>
+ 
+-#include <flight_zone_msgs/msg/vehicle_zone_status.hpp>
++#include <distance_control/msg/uas_pair_distance.hpp>
++#include <distance_control/msg/uas_related_distance_array.hpp>
+ 
+ #include <static_trajectory_manager/msg/static_trajectory.hpp>
+ #include <static_trajectory_manager/msg/static_trajectory_array.hpp>
+@@ -22,7 +23,6 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
+-#include <functional>
+ #include <limits>
+ #include <map>
+ #include <memory>
+@@ -37,39 +37,50 @@
+ namespace flight_zone_supervision
+ {
+ 
+-using SupervisionControl = flight_zone_supervision::action::SupervisionControl;
+-using GoalHandleSupervisionControl = rclcpp_action::ClientGoalHandle<SupervisionControl>;
+-using SupervisionControlClient = rclcpp_action::Client<SupervisionControl>;
+-
+-using DetectedCollisionTrajectory = collision_detection::msg::DetectedCollisionTrajectory;
+-using DetectedCollisionTrajectoryArray = collision_detection::msg::DetectedCollisionTrajectoryArray;
+-using VehicleZoneStatus = flight_zone_msgs::msg::VehicleZoneStatus;
+-using StaticTrajectory = static_trajectory_manager::msg::StaticTrajectory;
+-using StaticTrajectoryArray = static_trajectory_manager::msg::StaticTrajectoryArray;
+-using TrajectorySegment = static_trajectory_manager::msg::TrajectorySegment;
+-using Marker = visualization_msgs::msg::Marker;
+-using MarkerArray = visualization_msgs::msg::MarkerArray;
++using SupervisionControl =
++  flight_zone_supervision::action::SupervisionControl;
++using GoalHandleSupervisionControl =
++  rclcpp_action::ClientGoalHandle<SupervisionControl>;
++using SupervisionControlClient =
++  rclcpp_action::Client<SupervisionControl>;
++
++using DetectedCollisionTrajectory =
++  collision_detection::msg::DetectedCollisionTrajectory;
++using DetectedCollisionTrajectoryArray =
++  collision_detection::msg::DetectedCollisionTrajectoryArray;
++
++using UasPairDistance =
++  distance_control::msg::UasPairDistance;
++using UasRelatedDistanceArray =
++  distance_control::msg::UasRelatedDistanceArray;
++
++using StaticTrajectory =
++  static_trajectory_manager::msg::StaticTrajectory;
++using StaticTrajectoryArray =
++  static_trajectory_manager::msg::StaticTrajectoryArray;
++using TrajectorySegment =
++  static_trajectory_manager::msg::TrajectorySegment;
++
++using Marker =
++  visualization_msgs::msg::Marker;
++using MarkerArray =
++  visualization_msgs::msg::MarkerArray;
++
+ 
+ struct DroneContext
+ {
+   std::string uas_namespace;
+-  std::string status_topic;
+   std::string action_name;
+ 
+-  rclcpp::Subscription<VehicleZoneStatus>::SharedPtr status_subscription;
+   SupervisionControlClient::SharedPtr action_client;
+ 
+-  bool status_received{false};
+-  VehicleZoneStatus last_status;
+-  std::chrono::steady_clock::time_point last_status_at{};
+-
+   // Last runtime command dispatched and last one positively acknowledged
+-  // by the SupervisionControl action server. This covers PAUSE, RESUME,
+-  // ELEVATE, DESCEND and STOP.
++  // by the SupervisionControl action server.
+   int last_control_command{-1};
+   int last_confirmed_control_command{-1};
+   bool control_command_in_flight{false};
+ };
++
+ 
+ enum class PairMode : uint8_t
+ {
+@@ -83,6 +94,7 @@
+   CLEARED = 7U
+ };
+ 
++
+ struct PairState
+ {
+   std::string supervised_trajectory_id;
+@@ -92,28 +104,66 @@
+ 
+   PairMode mode{PairMode::MONITORING};
+ 
+-  bool status_valid{false};
+-  double distance_xy_m{std::numeric_limits<double>::infinity()};
+-
+-  // Captured exactly when the pair first enters the deconfliction sequence.
+-  // ELEVATE moves one grid step above this altitude. DESCEND must restore it.
++  bool distance_valid{false};
++  double distance_xy_m{
++    std::numeric_limits<double>::infinity()};
++
++  // Captured from /uas_related_distance exactly when the pair enters
++  // the deconfliction sequence. ELEVATE raises one grid step above this
++  // altitude and DESCEND must restore it.
+   bool reference_altitude_valid{false};
+   double reference_z_m{0.0};
+   std::string reference_frame;
+ };
+ 
+-static std::string trim_slashes(std::string value)
++
++struct RelatedPairView
+ {
+-  while (!value.empty() && value.front() == '/') {
++  bool valid{false};
++  std_msgs::msg::Header header;
++
++  geometry_msgs::msg::Point supervised_position;
++  geometry_msgs::msg::Point counterpart_position;
++
++  double distance_xy_m{
++    std::numeric_limits<double>::infinity()};
++};
++
++
++struct PositionSample
++{
++  std_msgs::msg::Header header;
++  geometry_msgs::msg::Point position;
++  std::chrono::steady_clock::time_point received_at{};
++};
++
++
++static std::string trim_slashes(
++  std::string value)
++{
++  while (
++    !value.empty() &&
++    value.front() == '/')
++  {
+     value.erase(value.begin());
+   }
+-  while (!value.empty() && value.back() == '/') {
++
++  while (
++    !value.empty() &&
++    value.back() == '/')
++  {
+     value.pop_back();
+   }
++
+   return value;
+ }
+ 
+-static std_msgs::msg::ColorRGBA color(float r, float g, float b, float a = 1.0F)
++
++static std_msgs::msg::ColorRGBA color(
++  float r,
++  float g,
++  float b,
++  float a = 1.0F)
+ {
+   std_msgs::msg::ColorRGBA out;
+   out.r = r;
+@@ -123,12 +173,21 @@
+   return out;
+ }
+ 
+-static std::size_t point_count(const TrajectorySegment & segment)
++
++static std::size_t point_count(
++  const TrajectorySegment & segment)
+ {
+-  return std::min(segment.x.size(), std::min(segment.y.size(), segment.z.size()));
++  return std::min(
++    segment.x.size(),
++    std::min(
++      segment.y.size(),
++      segment.z.size()));
+ }
+ 
+-static geometry_msgs::msg::Point point_at(const TrajectorySegment & segment, std::size_t index)
++
++static geometry_msgs::msg::Point point_at(
++  const TrajectorySegment & segment,
++  std::size_t index)
+ {
+   geometry_msgs::msg::Point point;
+   point.x = segment.x[index];
+@@ -137,361 +196,840 @@
+   return point;
+ }
+ 
++
+ class SupervisionNode : public rclcpp::Node
+ {
+ public:
+   SupervisionNode()
+   : Node("supervision_node")
+   {
+-    flight_zone_id_ = trim_slashes(
+-      declare_parameter<std::string>("flight_zone_id", ""));
+-
+-    available_topic_ = declare_parameter<std::string>(
+-      "available_static_trajectories_topic", "/available_static_trajectories");
+-    supervised_topic_ = declare_parameter<std::string>(
+-      "supervised_trajectories_topic", "/supervised_trajectories");
+-    active_topic_ = declare_parameter<std::string>(
+-      "active_trajectories_topic", "/active_trajectories");
+-
+-    zone_status_suffix_ = trim_slashes(
+-      declare_parameter<std::string>("zone_status_suffix", "zone_status"));
+-    control_action_suffix_ = trim_slashes(
+-      declare_parameter<std::string>("control_action_suffix", "supervision_control"));
+-
+-    // New XY-only deconfliction sequence.
++    flight_zone_id_ =
++      trim_slashes(
++      declare_parameter<std::string>(
++        "flight_zone_id",
++        ""));
++
++    available_topic_ =
++      declare_parameter<std::string>(
++      "available_static_trajectories_topic",
++      "/available_static_trajectories");
++
++    supervised_topic_ =
++      declare_parameter<std::string>(
++      "supervised_trajectories_topic",
++      "/supervised_trajectories");
++
++    active_topic_ =
++      declare_parameter<std::string>(
++      "active_trajectories_topic",
++      "/active_trajectories");
++
++    related_distance_topic_ =
++      declare_parameter<std::string>(
++      "related_distance_topic",
++      "/uas_related_distance");
++
++    control_action_suffix_ =
++      trim_slashes(
++      declare_parameter<std::string>(
++        "control_action_suffix",
++        "supervision_control"));
++
++    // Runtime deconfliction sequence.
+     //
+-    // 1) When the two UAS are closer than pause_distance_xy_m, PAUSE both.
+-    // 2) ELEVATE the supervised UAS by one grid step.
+-    // 3) RESUME the non-supervised counterpart.
+-    // 4) Keep watching XY separation until it is greater than
+-    //    release_distance_xy_m.
+-    // 5) DESCEND the supervised UAS to the altitude captured at step 1.
+-    // 6) RESUME the supervised trajectory.
++    // 1) distance_xy < pause_distance_xy_m:
++    //      PAUSE both UAS.
++    // 2) ELEVATE supervised UAS one grid step.
++    // 3) RESUME non-supervised counterpart.
++    // 4) Keep reading distance_xy from /uas_related_distance.
++    // 5) distance_xy > release_distance_xy_m:
++    //      DESCEND supervised UAS to captured altitude.
++    // 6) RESUME supervised trajectory.
++    //
++    // No distance is calculated by this node.
+     pause_distance_xy_m_ =
+-      declare_parameter<double>("pause_distance_xy_m", 1.5);
++      declare_parameter<double>(
++      "pause_distance_xy_m",
++      1.5);
++
+     release_distance_xy_m_ =
+-      declare_parameter<double>("release_distance_xy_m", 2.0);
++      declare_parameter<double>(
++      "release_distance_xy_m",
++      2.0);
+ 
+     vertical_grid_step_m_ =
+-      declare_parameter<double>("vertical_grid_step_m", 1.0);
++      declare_parameter<double>(
++      "vertical_grid_step_m",
++      1.0);
++
+     vertical_position_tolerance_m_ =
+-      declare_parameter<double>("vertical_position_tolerance_m", 0.15);
+-
+-    zone_status_timeout_s_ =
+-      declare_parameter<double>("zone_status_timeout_s", 2.0);
+-
+-    evaluation_period_ms_ = declare_parameter<int>("evaluation_period_ms", 100);
+-    action_wait_timeout_ms_ = declare_parameter<int>("action_wait_timeout_ms", 20);
+-
+-    markers_topic_ = declare_parameter<std::string>(
+-      "markers_topic", "supervision_markers");
+-    trajectory_line_width_ = declare_parameter<double>("trajectory_line_width", 0.10);
+-    collision_segment_width_ = declare_parameter<double>("collision_segment_width", 0.20);
+-    collision_node_scale_ = declare_parameter<double>("collision_node_scale", 0.34);
+-    drone_scale_ = declare_parameter<double>("drone_scale", 0.42);
+-    text_height_ = declare_parameter<double>("text_height", 0.30);
++      declare_parameter<double>(
++      "vertical_position_tolerance_m",
++      0.15);
++
++    related_distance_timeout_s_ =
++      declare_parameter<double>(
++      "related_distance_timeout_s",
++      2.0);
++
++    evaluation_period_ms_ =
++      declare_parameter<int>(
++      "evaluation_period_ms",
++      100);
++
++    action_wait_timeout_ms_ =
++      declare_parameter<int>(
++      "action_wait_timeout_ms",
++      20);
++
++    markers_topic_ =
++      declare_parameter<std::string>(
++      "markers_topic",
++      "supervision_markers");
++
++    trajectory_line_width_ =
++      declare_parameter<double>(
++      "trajectory_line_width",
++      0.10);
++
++    collision_segment_width_ =
++      declare_parameter<double>(
++      "collision_segment_width",
++      0.20);
++
++    collision_node_scale_ =
++      declare_parameter<double>(
++      "collision_node_scale",
++      0.34);
++
++    drone_scale_ =
++      declare_parameter<double>(
++      "drone_scale",
++      0.42);
++
++    pair_line_width_ =
++      declare_parameter<double>(
++      "pair_line_width",
++      0.06);
++
++    text_height_ =
++      declare_parameter<double>(
++      "text_height",
++      0.30);
+ 
+     validate_parameters();
+ 
+-    auto retained_qos = rclcpp::QoS(rclcpp::KeepLast(1));
++    auto retained_qos =
++      rclcpp::QoS(
++      rclcpp::KeepLast(1));
++
+     retained_qos.reliable();
+     retained_qos.transient_local();
+ 
+-    available_subscription_ = create_subscription<StaticTrajectoryArray>(
+-      available_topic_, retained_qos,
+-      std::bind(&SupervisionNode::available_callback, this, std::placeholders::_1));
+-
+-    supervised_subscription_ = create_subscription<DetectedCollisionTrajectoryArray>(
+-      supervised_topic_, retained_qos,
+-      std::bind(&SupervisionNode::supervised_callback, this, std::placeholders::_1));
+-
+-    active_subscription_ = create_subscription<StaticTrajectoryArray>(
+-      active_topic_, retained_qos,
+-      std::bind(&SupervisionNode::active_callback, this, std::placeholders::_1));
+-
+-    marker_publisher_ = create_publisher<MarkerArray>(markers_topic_, retained_qos);
+-
+-    evaluation_timer_ = create_wall_timer(
+-      std::chrono::milliseconds(evaluation_period_ms_),
+-      std::bind(&SupervisionNode::evaluate, this));
++    available_subscription_ =
++      create_subscription<StaticTrajectoryArray>(
++      available_topic_,
++      retained_qos,
++      std::bind(
++        &SupervisionNode::available_callback,
++        this,
++        std::placeholders::_1));
++
++    supervised_subscription_ =
++      create_subscription<
++        DetectedCollisionTrajectoryArray>(
++      supervised_topic_,
++      retained_qos,
++      std::bind(
++        &SupervisionNode::supervised_callback,
++        this,
++        std::placeholders::_1));
++
++    active_subscription_ =
++      create_subscription<StaticTrajectoryArray>(
++      active_topic_,
++      retained_qos,
++      std::bind(
++        &SupervisionNode::active_callback,
++        this,
++        std::placeholders::_1));
++
++    related_distance_subscription_ =
++      create_subscription<UasRelatedDistanceArray>(
++      related_distance_topic_,
++      retained_qos,
++      std::bind(
++        &SupervisionNode::related_distance_callback,
++        this,
++        std::placeholders::_1));
++
++    marker_publisher_ =
++      create_publisher<MarkerArray>(
++      markers_topic_,
++      retained_qos);
++
++    evaluation_timer_ =
++      create_wall_timer(
++      std::chrono::milliseconds(
++        evaluation_period_ms_),
++      std::bind(
++        &SupervisionNode::evaluate,
++        this));
+ 
+     RCLCPP_INFO(
+       get_logger(),
+-      "[/%s] supervision_node ready | available='%s' | supervised='%s' | active='%s' | "
+-      "pause_xy<%.3f m | release_xy>%.3f m | vertical_grid_step=%.3f m | "
+-      "vertical_tolerance=%.3f m | action_suffix='%s'",
++      "[/%s] supervision_node ready | "
++      "available='%s' | supervised='%s' | "
++      "active='%s' | related_distance='%s' | "
++      "pause_xy<%.3f m | release_xy>%.3f m | "
++      "vertical_grid_step=%.3f m | "
++      "vertical_tolerance=%.3f m | "
++      "distance_timeout=%.3f s | action_suffix='%s'",
+       flight_zone_id_.c_str(),
+       available_topic_.c_str(),
+       supervised_topic_.c_str(),
+       active_topic_.c_str(),
++      related_distance_topic_.c_str(),
+       pause_distance_xy_m_,
+       release_distance_xy_m_,
+       vertical_grid_step_m_,
+       vertical_position_tolerance_m_,
++      related_distance_timeout_s_,
+       control_action_suffix_.c_str());
+   }
+ 
+ private:
+   void validate_parameters() const
+   {
+-    if (flight_zone_id_.empty() || flight_zone_id_.find('/') != std::string::npos) {
+-      throw std::runtime_error("flight_zone_id must be one non-empty ROS namespace segment");
+-    }
+-
+-    const auto absolute = [](const std::string & value) {
+-        return !value.empty() && value.front() == '/';
++    if (
++      flight_zone_id_.empty() ||
++      flight_zone_id_.find('/') !=
++      std::string::npos)
++    {
++      throw std::runtime_error(
++              "flight_zone_id must be one "
++              "non-empty ROS namespace segment");
++    }
++
++    const auto absolute =
++      [](const std::string & value) {
++        return
++          !value.empty() &&
++          value.front() == '/';
+       };
+ 
+-    if (!absolute(available_topic_) || !absolute(supervised_topic_) || !absolute(active_topic_)) {
+-      throw std::runtime_error("Global trajectory input topics must be absolute");
+-    }
+-
+-    if (zone_status_suffix_.empty() || control_action_suffix_.empty() || markers_topic_.empty()) {
+-      throw std::runtime_error("Topic/action suffixes and markers_topic must not be empty");
+-    }
+-
+-    if (!std::isfinite(pause_distance_xy_m_) || pause_distance_xy_m_ <= 0.0) {
+-      throw std::runtime_error("pause_distance_xy_m must be finite and > 0");
+-    }
+-
+-    if (
+-      !std::isfinite(release_distance_xy_m_) ||
+-      release_distance_xy_m_ <= pause_distance_xy_m_)
++    if (
++      !absolute(available_topic_) ||
++      !absolute(supervised_topic_) ||
++      !absolute(active_topic_) ||
++      !absolute(related_distance_topic_))
+     {
+       throw std::runtime_error(
+-              "release_distance_xy_m must be finite and > pause_distance_xy_m");
+-    }
+-
+-    if (!std::isfinite(vertical_grid_step_m_) || vertical_grid_step_m_ <= 0.0) {
+-      throw std::runtime_error("vertical_grid_step_m must be finite and > 0");
+-    }
+-
+-    if (
+-      !std::isfinite(vertical_position_tolerance_m_) ||
++              "Global input topics must be absolute");
++    }
++
++    if (
++      control_action_suffix_.empty() ||
++      control_action_suffix_.find('/') !=
++      std::string::npos ||
++      markers_topic_.empty())
++    {
++      throw std::runtime_error(
++              "control_action_suffix must be one "
++              "non-empty relative ROS name segment "
++              "and markers_topic must not be empty");
++    }
++
++    if (
++      !std::isfinite(
++        pause_distance_xy_m_) ||
++      pause_distance_xy_m_ <= 0.0)
++    {
++      throw std::runtime_error(
++              "pause_distance_xy_m "
++              "must be finite and > 0");
++    }
++
++    if (
++      !std::isfinite(
++        release_distance_xy_m_) ||
++      release_distance_xy_m_ <=
++      pause_distance_xy_m_)
++    {
++      throw std::runtime_error(
++              "release_distance_xy_m must be "
++              "finite and > pause_distance_xy_m");
++    }
++
++    if (
++      !std::isfinite(
++        vertical_grid_step_m_) ||
++      vertical_grid_step_m_ <= 0.0)
++    {
++      throw std::runtime_error(
++              "vertical_grid_step_m "
++              "must be finite and > 0");
++    }
++
++    if (
++      !std::isfinite(
++        vertical_position_tolerance_m_) ||
+       vertical_position_tolerance_m_ <= 0.0 ||
+-      vertical_position_tolerance_m_ >= vertical_grid_step_m_)
++      vertical_position_tolerance_m_ >=
++      vertical_grid_step_m_)
+     {
+       throw std::runtime_error(
+-              "vertical_position_tolerance_m must be finite, > 0 and < vertical_grid_step_m");
+-    }
+-
+-    if (!std::isfinite(zone_status_timeout_s_) || zone_status_timeout_s_ <= 0.0) {
+-      throw std::runtime_error("zone_status_timeout_s must be finite and > 0");
+-    }
+-
+-    if (evaluation_period_ms_ <= 0 || action_wait_timeout_ms_ < 0) {
+-      throw std::runtime_error("evaluation_period_ms must be > 0 and action_wait_timeout_ms >= 0");
+-    }
+-  }
+-
+-  std::string status_topic_for(const std::string & uas_namespace) const
+-  {
+-    return "/" + flight_zone_id_ + "/" + trim_slashes(uas_namespace) + "/" + zone_status_suffix_;
+-  }
+-
+-  std::string action_name_for(const std::string & uas_namespace) const
+-  {
+-    return "/" + flight_zone_id_ + "/" + trim_slashes(uas_namespace) + "/" + control_action_suffix_;
+-  }
+-
+-  void ensure_drone_context_locked(const std::string & raw_uas_namespace)
+-  {
+-    const std::string uas_namespace = trim_slashes(raw_uas_namespace);
+-    if (uas_namespace.empty() || drones_.find(uas_namespace) != drones_.end()) {
++              "vertical_position_tolerance_m must "
++              "be finite, > 0 and < "
++              "vertical_grid_step_m");
++    }
++
++    if (
++      !std::isfinite(
++        related_distance_timeout_s_) ||
++      related_distance_timeout_s_ <= 0.0)
++    {
++      throw std::runtime_error(
++              "related_distance_timeout_s "
++              "must be finite and > 0");
++    }
++
++    if (
++      evaluation_period_ms_ <= 0 ||
++      action_wait_timeout_ms_ < 0)
++    {
++      throw std::runtime_error(
++              "evaluation_period_ms must be > 0 "
++              "and action_wait_timeout_ms >= 0");
++    }
++
++    if (
++      !std::isfinite(
++        trajectory_line_width_) ||
++      trajectory_line_width_ <= 0.0 ||
++      !std::isfinite(
++        collision_segment_width_) ||
++      collision_segment_width_ <= 0.0 ||
++      !std::isfinite(
++        collision_node_scale_) ||
++      collision_node_scale_ <= 0.0 ||
++      !std::isfinite(
++        drone_scale_) ||
++      drone_scale_ <= 0.0 ||
++      !std::isfinite(
++        pair_line_width_) ||
++      pair_line_width_ <= 0.0 ||
++      !std::isfinite(
++        text_height_) ||
++      text_height_ <= 0.0)
++    {
++      throw std::runtime_error(
++              "marker dimensions must be finite "
++              "and > 0");
++    }
++  }
++
++
++  std::string action_name_for(
++    const std::string & uas_namespace) const
++  {
++    return
++      "/" +
++      flight_zone_id_ +
++      "/" +
++      trim_slashes(
++        uas_namespace) +
++      "/" +
++      control_action_suffix_;
++  }
++
++
++  void ensure_drone_context_locked(
++    const std::string & raw_uas_namespace)
++  {
++    const std::string uas_namespace =
++      trim_slashes(
++      raw_uas_namespace);
++
++    if (uas_namespace.empty()) {
+       return;
+     }
+ 
++    auto existing =
++      drones_.find(
++      uas_namespace);
++
++    if (
++      existing !=
++      drones_.end())
++    {
++      return;
++    }
++
+     DroneContext context;
+-    context.uas_namespace = uas_namespace;
+-    context.status_topic = status_topic_for(uas_namespace);
+-    context.action_name = action_name_for(uas_namespace);
+-
+-    auto status_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+-    status_qos.reliable();
+-
+-    context.status_subscription = create_subscription<VehicleZoneStatus>(
+-      context.status_topic, status_qos,
+-      [this, uas_namespace](const VehicleZoneStatus::SharedPtr message) {
+-        status_callback(uas_namespace, message);
+-      });
+-
+-    context.action_client = rclcpp_action::create_client<SupervisionControl>(
+-      this, context.action_name);
++    context.uas_namespace =
++      uas_namespace;
++    context.action_name =
++      action_name_for(
++      uas_namespace);
++
++    context.action_client =
++      rclcpp_action::create_client<
++        SupervisionControl>(
++      this,
++      context.action_name);
+ 
+     RCLCPP_INFO(
+-      get_logger(), "[/%s] tracking UAS '%s' | status='%s' | action='%s'",
+-      flight_zone_id_.c_str(), uas_namespace.c_str(), context.status_topic.c_str(),
+-      context.action_name.c_str());
+-
+-    drones_.emplace(uas_namespace, std::move(context));
+-  }
+-
+-  const StaticTrajectory * find_known_trajectory_locked(const std::string & trajectory_id) const
+-  {
+-    const auto available_it = available_.find(trajectory_id);
+-    if (available_it != available_.end()) {
+-      return &available_it->second;
+-    }
+-
+-    const auto active_it = active_.find(trajectory_id);
+-    if (active_it != active_.end()) {
+-      return &active_it->second;
+-    }
+-
+-    const auto supervised_it = supervised_.find(trajectory_id);
+-    if (supervised_it != supervised_.end()) {
+-      return &supervised_it->second.trajectory;
++      get_logger(),
++      "[/%s] tracking UAS '%s' | action='%s' | "
++      "position/distance source='%s'",
++      flight_zone_id_.c_str(),
++      uas_namespace.c_str(),
++      context.action_name.c_str(),
++      related_distance_topic_.c_str());
++
++    drones_.emplace(
++      uas_namespace,
++      std::move(context));
++  }
++
++
++  const StaticTrajectory *
++  find_known_trajectory_locked(
++    const std::string & trajectory_id) const
++  {
++    const auto available_it =
++      available_.find(
++      trajectory_id);
++
++    if (
++      available_it !=
++      available_.end())
++    {
++      return
++        &available_it->second;
++    }
++
++    const auto active_it =
++      active_.find(
++      trajectory_id);
++
++    if (
++      active_it !=
++      active_.end())
++    {
++      return
++        &active_it->second;
++    }
++
++    const auto supervised_it =
++      supervised_.find(
++      trajectory_id);
++
++    if (
++      supervised_it !=
++      supervised_.end())
++    {
++      return
++        &supervised_it->second.trajectory;
+     }
+ 
+     return nullptr;
+   }
+ 
++
+   void rebuild_required_drones_locked()
+   {
+     std::set<std::string> required;
+ 
+-    for (const auto & [_, detected] : supervised_) {
+-      if (detected.trajectory.flight_zone_id != flight_zone_id_) {
++    // Every active trajectory in this flight-zone belongs to a UAS whose
++    // action state must be visualised and may receive EXECUTE.
++    for (
++      const auto & [_, trajectory] :
++      active_)
++    {
++      const std::string uas =
++        trim_slashes(
++        trajectory.uas_namespace);
++
++      if (!uas.empty()) {
++        required.insert(
++          uas);
++      }
++    }
++
++    // Keep supervised owners even if a retained supervised snapshot arrives
++    // before their active occurrence.
++    for (
++      const auto & [_, detected] :
++      supervised_)
++    {
++      if (
++        trim_slashes(
++          detected.trajectory.flight_zone_id) !=
++        flight_zone_id_)
++      {
+         continue;
+       }
+ 
+-      const std::string owner = trim_slashes(detected.trajectory.uas_namespace);
++      const std::string owner =
++        trim_slashes(
++        detected.trajectory.uas_namespace);
++
+       if (!owner.empty()) {
+-        required.insert(owner);
++        required.insert(
++          owner);
+       }
+ 
+-      for (const auto & conflicting_id : detected.conflicting_trajectory_ids) {
+-        const StaticTrajectory * counterpart = find_known_trajectory_locked(conflicting_id);
+-        if (counterpart == nullptr || counterpart->flight_zone_id != flight_zone_id_) {
++      for (
++        const auto & conflicting_id :
++        detected.conflicting_trajectory_ids)
++      {
++        const StaticTrajectory * counterpart =
++          find_known_trajectory_locked(
++          conflicting_id);
++
++        if (
++          counterpart == nullptr ||
++          trim_slashes(
++            counterpart->flight_zone_id) !=
++          flight_zone_id_)
++        {
+           continue;
+         }
+-        const std::string uas = trim_slashes(counterpart->uas_namespace);
++
++        const std::string uas =
++          trim_slashes(
++          counterpart->uas_namespace);
++
+         if (!uas.empty()) {
+-          required.insert(uas);
++          required.insert(
++            uas);
+         }
+       }
+     }
+ 
+-    for (const auto & uas : required) {
+-      ensure_drone_context_locked(uas);
+-    }
+-
+-    for (auto it = drones_.begin(); it != drones_.end();) {
+-      if (required.count(it->first) == 0U) {
+-        it = drones_.erase(it);
++    for (
++      const auto & uas :
++      required)
++    {
++      ensure_drone_context_locked(
++        uas);
++    }
++
++    for (
++      auto it =
++        drones_.begin();
++      it !=
++      drones_.end();)
++    {
++      if (
++        required.count(
++          it->first) == 0U)
++      {
++        positions_.erase(
++          it->first);
++
++        it =
++          drones_.erase(it);
+       } else {
+         ++it;
+       }
+     }
+   }
+ 
+-  void status_callback(const std::string & uas_namespace, const VehicleZoneStatus::SharedPtr message)
++
++  void available_callback(
++    const StaticTrajectoryArray::SharedPtr message)
+   {
+     if (!message) {
+       return;
+     }
+ 
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    const auto it = drones_.find(uas_namespace);
+-    if (it == drones_.end()) {
+-      return;
+-    }
+-
+-    it->second.last_status = *message;
+-    it->second.last_status_at = std::chrono::steady_clock::now();
+-    it->second.status_received = true;
+-  }
+-
+-  void available_callback(const StaticTrajectoryArray::SharedPtr message)
++    std::lock_guard<std::mutex>
++      lock(mutex_);
++
++    available_.clear();
++
++    for (
++      const auto & trajectory :
++      message->trajectories)
++    {
++      if (
++        trim_slashes(
++          trajectory.flight_zone_id) ==
++        flight_zone_id_ &&
++        !trajectory.trajectory_id.empty())
++      {
++        available_[
++          trajectory.trajectory_id] =
++          trajectory;
++      }
++    }
++
++    latest_header_ =
++      message->header;
++
++    rebuild_required_drones_locked();
++  }
++
++
++  void supervised_callback(
++    const DetectedCollisionTrajectoryArray::SharedPtr
++      message)
+   {
+     if (!message) {
+       return;
+     }
+ 
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    available_.clear();
+-
+-    for (const auto & trajectory : message->trajectories) {
+-      if (trajectory.flight_zone_id == flight_zone_id_ && !trajectory.trajectory_id.empty()) {
+-        available_[trajectory.trajectory_id] = trajectory;
++    std::lock_guard<std::mutex>
++      lock(mutex_);
++
++    supervised_.clear();
++
++    for (
++      const auto & detected :
++      message->trajectories)
++    {
++      if (
++        trim_slashes(
++          detected.trajectory.flight_zone_id) ==
++        flight_zone_id_ &&
++        !detected.trajectory.trajectory_id.empty())
++      {
++        supervised_[
++          detected.trajectory.trajectory_id] =
++          detected;
+       }
+     }
+ 
+-    latest_header_ = message->header;
++    latest_header_ =
++      message->header;
++
+     rebuild_required_drones_locked();
+   }
+ 
+-  void supervised_callback(const DetectedCollisionTrajectoryArray::SharedPtr message)
++
++  void active_callback(
++    const StaticTrajectoryArray::SharedPtr message)
+   {
+     if (!message) {
+       return;
+     }
+ 
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    supervised_.clear();
+-
+-    for (const auto & detected : message->trajectories) {
+-      if (detected.trajectory.flight_zone_id == flight_zone_id_ &&
+-        !detected.trajectory.trajectory_id.empty())
++    std::lock_guard<std::mutex>
++      lock(mutex_);
++
++    active_.clear();
++
++    for (
++      const auto & trajectory :
++      message->trajectories)
++    {
++      if (
++        trim_slashes(
++          trajectory.flight_zone_id) ==
++        flight_zone_id_ &&
++        !trajectory.trajectory_id.empty())
+       {
+-        supervised_[detected.trajectory.trajectory_id] = detected;
++        active_[
++          trajectory.trajectory_id] =
++          trajectory;
+       }
+     }
+ 
+-    latest_header_ = message->header;
++    latest_header_ =
++      message->header;
++
+     rebuild_required_drones_locked();
+-  }
+-
+-  void active_callback(const StaticTrajectoryArray::SharedPtr message)
+-  {
+-    if (!message) {
+-      return;
+-    }
+-
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    active_.clear();
+-
+-    for (const auto & trajectory : message->trajectories) {
+-      if (trajectory.flight_zone_id == flight_zone_id_ && !trajectory.trajectory_id.empty()) {
+-        active_[trajectory.trajectory_id] = trajectory;
+-      }
+-    }
+-
+-    latest_header_ = message->header;
+-    rebuild_required_drones_locked();
+-
+-    std::set<std::string> live_occurrences;
+-    for (const auto & [_, trajectory] : active_) {
+-      live_occurrences.insert(occurrence_key(trajectory));
+-    }
+-
+-    for (auto it = execute_dispatched_.begin(); it != execute_dispatched_.end();) {
+-      if (live_occurrences.count(*it) == 0U) {
+-        it = execute_dispatched_.erase(it);
++
++    std::set<std::string>
++      live_occurrences;
++
++    for (
++      const auto & [_, trajectory] :
++      active_)
++    {
++      live_occurrences.insert(
++        occurrence_key(
++          trajectory));
++    }
++
++    for (
++      auto it =
++        execute_dispatched_.begin();
++      it !=
++      execute_dispatched_.end();)
++    {
++      if (
++        live_occurrences.count(
++          *it) == 0U)
++      {
++        it =
++          execute_dispatched_.erase(
++          it);
+       } else {
+         ++it;
+       }
+     }
+   }
+ 
+-  static std::string occurrence_key(const StaticTrajectory & trajectory)
++
++  void related_distance_callback(
++    const UasRelatedDistanceArray::SharedPtr message)
++  {
++    if (!message) {
++      return;
++    }
++
++    std::lock_guard<std::mutex>
++      lock(mutex_);
++
++    latest_related_distance_ =
++      *message;
++
++    latest_related_distance_received_ =
++      true;
++
++    latest_related_distance_at_ =
++      std::chrono::steady_clock::now();
++
++    // Refresh the latest known positions for UAS in this flight-zone.
++    //
++    // The distance_control_node already guarantees that the two positions
++    // of a valid pair are expressed in the same frame.
++    for (
++      const auto & pair :
++      message->pairs)
++    {
++      if (
++        trim_slashes(
++          pair.first_flight_zone_id) ==
++        flight_zone_id_)
++      {
++        PositionSample sample;
++        sample.header =
++          pair.header;
++        sample.position =
++          pair.first_position;
++        sample.received_at =
++          latest_related_distance_at_;
++
++        positions_[
++          trim_slashes(
++            pair.first_uas_namespace)] =
++          sample;
++      }
++
++      if (
++        trim_slashes(
++          pair.second_flight_zone_id) ==
++        flight_zone_id_)
++      {
++        PositionSample sample;
++        sample.header =
++          pair.header;
++        sample.position =
++          pair.second_position;
++        sample.received_at =
++          latest_related_distance_at_;
++
++        positions_[
++          trim_slashes(
++            pair.second_uas_namespace)] =
++          sample;
++      }
++    }
++  }
++
++
++  static std::string occurrence_key(
++    const StaticTrajectory & trajectory)
+   {
+     std::ostringstream stream;
+-    stream << trajectory.trajectory_id << "@"
+-           << trajectory.operation_start_utc.sec << ":"
+-           << trajectory.operation_start_utc.nanosec;
++
++    stream
++      << trajectory.trajectory_id
++      << "@"
++      << trajectory.operation_start_utc.sec
++      << ":"
++      << trajectory.operation_start_utc.nanosec;
++
+     return stream.str();
+   }
+ 
+-  static bool tracked_runtime_command(uint8_t command)
++
++  static bool tracked_runtime_command(
++    uint8_t command)
+   {
+     return
+-      command == SupervisionControl::Goal::PAUSE ||
+-      command == SupervisionControl::Goal::RESUME ||
+-      command == SupervisionControl::Goal::ELEVATE ||
+-      command == SupervisionControl::Goal::DESCEND ||
+-      command == SupervisionControl::Goal::STOP;
+-  }
++      command ==
++      SupervisionControl::Goal::PAUSE ||
++      command ==
++      SupervisionControl::Goal::RESUME ||
++      command ==
++      SupervisionControl::Goal::ELEVATE ||
++      command ==
++      SupervisionControl::Goal::DESCEND ||
++      command ==
++      SupervisionControl::Goal::STOP;
++  }
++
++
++  static const char * command_name(
++    int command)
++  {
++    if (
++      command ==
++      static_cast<int>(
++        SupervisionControl::Goal::EXECUTE))
++    {
++      return "EXECUTE";
++    }
++
++    if (
++      command ==
++      static_cast<int>(
++        SupervisionControl::Goal::PAUSE))
++    {
++      return "PAUSE";
++    }
++
++    if (
++      command ==
++      static_cast<int>(
++        SupervisionControl::Goal::RESUME))
++    {
++      return "RESUME";
++    }
++
++    if (
++      command ==
++      static_cast<int>(
++        SupervisionControl::Goal::ELEVATE))
++    {
++      return "ELEVATE";
++    }
++
++    if (
++      command ==
++      static_cast<int>(
++        SupervisionControl::Goal::DESCEND))
++    {
++      return "DESCEND";
++    }
++
++    if (
++      command ==
++      static_cast<int>(
++        SupervisionControl::Goal::STOP))
++    {
++      return "STOP";
++    }
++
++    return "NONE";
++  }
++
+ 
+   void send_action_locked(
+     const std::string & uas_namespace,
+@@ -500,151 +1038,301 @@
+     const std::string & reason,
+     const std::string & occurrence = "")
+   {
+-    ensure_drone_context_locked(uas_namespace);
+-    auto context_it = drones_.find(trim_slashes(uas_namespace));
+-    if (context_it == drones_.end() || !context_it->second.action_client) {
++    ensure_drone_context_locked(
++      uas_namespace);
++
++    auto context_it =
++      drones_.find(
++      trim_slashes(
++        uas_namespace));
++
++    if (
++      context_it ==
++      drones_.end() ||
++      !context_it->second.action_client)
++    {
+       return;
+     }
+ 
+-    auto client = context_it->second.action_client;
+-    if (!client->wait_for_action_server(std::chrono::milliseconds(action_wait_timeout_ms_))) {
++    auto client =
++      context_it->second.action_client;
++
++    if (
++      !client->wait_for_action_server(
++        std::chrono::milliseconds(
++          action_wait_timeout_ms_)))
++    {
+       RCLCPP_WARN_THROTTLE(
+-        get_logger(), *get_clock(), 2000,
+-        "[/%s/%s] supervision control action '%s' is not available",
+-        flight_zone_id_.c_str(), uas_namespace.c_str(), context_it->second.action_name.c_str());
++        get_logger(),
++        *get_clock(),
++        2000,
++        "[/%s/%s] supervision control action "
++        "'%s' is not available",
++        flight_zone_id_.c_str(),
++        uas_namespace.c_str(),
++        context_it->second.action_name.c_str());
++
+       return;
+     }
+ 
+     SupervisionControl::Goal goal;
+-    goal.command = command;
+-    goal.reason = reason;
++    goal.command =
++      command;
++    goal.reason =
++      reason;
+ 
+     if (trajectory != nullptr) {
+-      goal.trajectories.header = latest_header_;
+-      goal.trajectories.header.stamp = now();
+-      goal.trajectories.trajectories.push_back(*trajectory);
+-    }
+-
+-    rclcpp_action::Client<SupervisionControl>::SendGoalOptions options;
++      goal.trajectories.header =
++        latest_header_;
++
++      goal.trajectories.header.stamp =
++        now();
++
++      goal.trajectories.trajectories.push_back(
++        *trajectory);
++    }
++
++    rclcpp_action::Client<
++      SupervisionControl>::SendGoalOptions
++      options;
+ 
+     options.goal_response_callback =
+       [this, uas_namespace, command, occurrence](
+-      const GoalHandleSupervisionControl::SharedPtr goal_handle)
++      const GoalHandleSupervisionControl::SharedPtr
++        goal_handle)
+       {
+         if (goal_handle) {
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s/%s] supervision action command=%u accepted by action server",
++            "[/%s/%s] supervision action "
++            "command=%u (%s) accepted by "
++            "action server",
+             flight_zone_id_.c_str(),
+             uas_namespace.c_str(),
+-            static_cast<unsigned>(command));
++            static_cast<unsigned>(
++              command),
++            command_name(
++              static_cast<int>(
++                command)));
++
+           return;
+         }
+ 
+         RCLCPP_ERROR(
+           get_logger(),
+-          "[/%s/%s] supervision action command=%u rejected by action server",
++          "[/%s/%s] supervision action "
++          "command=%u (%s) rejected by "
++          "action server",
+           flight_zone_id_.c_str(),
+           uas_namespace.c_str(),
+-          static_cast<unsigned>(command));
+-
+-        std::lock_guard<std::mutex> lock(mutex_);
+-
+-        if (command == SupervisionControl::Goal::EXECUTE && !occurrence.empty()) {
+-          execute_dispatched_.erase(occurrence);
++          static_cast<unsigned>(
++            command),
++          command_name(
++            static_cast<int>(
++              command)));
++
++        std::lock_guard<std::mutex>
++          lock(mutex_);
++
++        if (
++          command ==
++          SupervisionControl::Goal::EXECUTE &&
++          !occurrence.empty())
++        {
++          execute_dispatched_.erase(
++            occurrence);
+           return;
+         }
+ 
+-        if (tracked_runtime_command(command)) {
+-          const auto it = drones_.find(trim_slashes(uas_namespace));
+-          if (it != drones_.end()) {
+-            if (it->second.last_control_command == static_cast<int>(command)) {
+-              it->second.last_control_command = -1;
++        if (
++          tracked_runtime_command(
++            command))
++        {
++          const auto it =
++            drones_.find(
++            trim_slashes(
++              uas_namespace));
++
++          if (
++            it !=
++            drones_.end())
++          {
++            if (
++              it->second.last_control_command ==
++              static_cast<int>(
++                command))
++            {
++              it->second.last_control_command =
++                -1;
+             }
+-            it->second.control_command_in_flight = false;
++
++            it->second.control_command_in_flight =
++              false;
+           }
+         }
+       };
+ 
+     options.result_callback =
+       [this, uas_namespace, command, occurrence](
+-      const GoalHandleSupervisionControl::WrappedResult & result)
++      const GoalHandleSupervisionControl::
++        WrappedResult & result)
+       {
+         const bool success =
+-          result.code == rclcpp_action::ResultCode::SUCCEEDED &&
++          result.code ==
++          rclcpp_action::ResultCode::SUCCEEDED &&
+           result.result &&
+           result.result->accepted;
+ 
+-        std::lock_guard<std::mutex> lock(mutex_);
++        std::lock_guard<std::mutex>
++          lock(mutex_);
+ 
+         if (success) {
+-          if (tracked_runtime_command(command)) {
+-            const auto it = drones_.find(trim_slashes(uas_namespace));
+-            if (it != drones_.end()) {
+-              it->second.last_confirmed_control_command =
+-                static_cast<int>(command);
+-              it->second.control_command_in_flight = false;
++          if (
++            tracked_runtime_command(
++              command))
++          {
++            const auto it =
++              drones_.find(
++              trim_slashes(
++                uas_namespace));
++
++            if (
++              it !=
++              drones_.end())
++            {
++              it->second.
++                last_confirmed_control_command =
++                static_cast<int>(
++                command);
++
++              it->second.
++                control_command_in_flight =
++                false;
+             }
+           }
+ 
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s/%s] supervision command=%u positively acknowledged",
++            "[/%s/%s] supervision command=%u "
++            "(%s) positively acknowledged",
+             flight_zone_id_.c_str(),
+             uas_namespace.c_str(),
+-            static_cast<unsigned>(command));
++            static_cast<unsigned>(
++              command),
++            command_name(
++              static_cast<int>(
++                command)));
++
+           return;
+         }
+ 
+         RCLCPP_WARN(
+           get_logger(),
+-          "[/%s/%s] supervision action command=%u did not complete successfully",
++          "[/%s/%s] supervision action "
++          "command=%u (%s) did not complete "
++          "successfully",
+           flight_zone_id_.c_str(),
+           uas_namespace.c_str(),
+-          static_cast<unsigned>(command));
+-
+-        if (command == SupervisionControl::Goal::EXECUTE && !occurrence.empty()) {
+-          execute_dispatched_.erase(occurrence);
++          static_cast<unsigned>(
++            command),
++          command_name(
++            static_cast<int>(
++              command)));
++
++        if (
++          command ==
++          SupervisionControl::Goal::EXECUTE &&
++          !occurrence.empty())
++        {
++          execute_dispatched_.erase(
++            occurrence);
+           return;
+         }
+ 
+-        if (tracked_runtime_command(command)) {
+-          const auto it = drones_.find(trim_slashes(uas_namespace));
+-          if (it != drones_.end()) {
+-            if (it->second.last_control_command == static_cast<int>(command)) {
+-              it->second.last_control_command = -1;
++        if (
++          tracked_runtime_command(
++            command))
++        {
++          const auto it =
++            drones_.find(
++            trim_slashes(
++              uas_namespace));
++
++          if (
++            it !=
++            drones_.end())
++          {
++            if (
++              it->second.last_control_command ==
++              static_cast<int>(
++                command))
++            {
++              it->second.last_control_command =
++                -1;
+             }
+-            it->second.control_command_in_flight = false;
++
++            it->second.
++              control_command_in_flight =
++              false;
+           }
+         }
+       };
+ 
+-    client->async_send_goal(goal, options);
+-
+-    if (command == SupervisionControl::Goal::EXECUTE && !occurrence.empty()) {
+-      execute_dispatched_.insert(occurrence);
+-    } else if (tracked_runtime_command(command)) {
+-      context_it->second.last_control_command = static_cast<int>(command);
+-      context_it->second.control_command_in_flight = true;
+-    }
+-  }
++    client->async_send_goal(
++      goal,
++      options);
++
++    if (
++      command ==
++      SupervisionControl::Goal::EXECUTE &&
++      !occurrence.empty())
++    {
++      execute_dispatched_.insert(
++        occurrence);
++    } else if (
++      tracked_runtime_command(
++        command))
++    {
++      context_it->second.last_control_command =
++        static_cast<int>(
++        command);
++
++      context_it->second.control_command_in_flight =
++        true;
++    }
++  }
++
+ 
+   void ensure_command_locked(
+     const std::string & uas_namespace,
+     uint8_t command,
+     const std::string & reason)
+   {
+-    ensure_drone_context_locked(uas_namespace);
+-    const auto it = drones_.find(trim_slashes(uas_namespace));
+-    if (it == drones_.end()) {
++    ensure_drone_context_locked(
++      uas_namespace);
++
++    const auto it =
++      drones_.find(
++      trim_slashes(
++        uas_namespace));
++
++    if (
++      it ==
++      drones_.end())
++    {
+       return;
+     }
+ 
+     if (
+-      it->second.last_control_command == static_cast<int>(command) &&
++      it->second.last_control_command ==
++      static_cast<int>(
++        command) &&
+       (
+         it->second.control_command_in_flight ||
+-        it->second.last_confirmed_control_command == static_cast<int>(command)))
++        it->second.
++          last_confirmed_control_command ==
++        static_cast<int>(
++          command)))
+     {
+       return;
+     }
+@@ -656,150 +1344,346 @@
+       reason);
+   }
+ 
++
+   bool command_confirmed_locked(
+     const std::string & uas_namespace,
+     uint8_t command) const
+   {
+-    const auto it = drones_.find(trim_slashes(uas_namespace));
+-    if (it == drones_.end()) {
++    const auto it =
++      drones_.find(
++      trim_slashes(
++        uas_namespace));
++
++    if (
++      it ==
++      drones_.end())
++    {
+       return false;
+     }
+ 
+     return
+-      it->second.last_confirmed_control_command ==
+-      static_cast<int>(command);
+-  }
+-
+-  bool fresh_status_locked(const std::string & uas_namespace, const VehicleZoneStatus *& output) const
+-  {
+-    const auto it = drones_.find(trim_slashes(uas_namespace));
+-    if (it == drones_.end() || !it->second.status_received) {
+-      output = nullptr;
++      it->second.
++        last_confirmed_control_command ==
++      static_cast<int>(
++        command);
++  }
++
++
++  bool related_distance_snapshot_fresh_locked() const
++  {
++    if (
++      !latest_related_distance_received_)
++    {
+       return false;
+     }
+ 
+-    const double age_s = std::chrono::duration<double>(
+-      std::chrono::steady_clock::now() - it->second.last_status_at).count();
+-
+-    if (age_s > zone_status_timeout_s_) {
+-      output = nullptr;
++    const double age_s =
++      std::chrono::duration<double>(
++      std::chrono::steady_clock::now() -
++      latest_related_distance_at_).count();
++
++    return
++      age_s <=
++      related_distance_timeout_s_;
++  }
++
++
++  bool fresh_position_locked(
++    const std::string & uas_namespace,
++    PositionSample & output) const
++  {
++    const auto it =
++      positions_.find(
++      trim_slashes(
++        uas_namespace));
++
++    if (
++      it ==
++      positions_.end())
++    {
+       return false;
+     }
+ 
+-    output = &it->second.last_status;
++    const double age_s =
++      std::chrono::duration<double>(
++      std::chrono::steady_clock::now() -
++      it->second.received_at).count();
++
++    if (
++      age_s >
++      related_distance_timeout_s_)
++    {
++      return false;
++    }
++
++    output =
++      it->second;
++
+     return true;
+   }
+ 
+-  static double vehicle_xy_distance(
+-    const VehicleZoneStatus & first,
+-    const VehicleZoneStatus & second)
+-  {
+-    const double dx =
+-      first.position.x -
+-      second.position.x;
+-    const double dy =
+-      first.position.y -
+-      second.position.y;
+-
+-    return std::sqrt(dx * dx + dy * dy);
+-  }
+-
+-  static const char * pair_mode_name(PairMode mode)
++
++  bool find_related_pair_locked(
++    const std::string & supervised_uas,
++    const std::string & counterpart_uas,
++    RelatedPairView & output) const
++  {
++    output =
++      RelatedPairView{};
++
++    if (
++      !related_distance_snapshot_fresh_locked())
++    {
++      return false;
++    }
++
++    const std::string supervised =
++      trim_slashes(
++      supervised_uas);
++
++    const std::string counterpart =
++      trim_slashes(
++      counterpart_uas);
++
++    for (
++      const auto & pair :
++      latest_related_distance_.pairs)
++    {
++      const std::string first_zone =
++        trim_slashes(
++        pair.first_flight_zone_id);
++
++      const std::string second_zone =
++        trim_slashes(
++        pair.second_flight_zone_id);
++
++      const std::string first_uas =
++        trim_slashes(
++        pair.first_uas_namespace);
++
++      const std::string second_uas =
++        trim_slashes(
++        pair.second_uas_namespace);
++
++      if (
++        first_zone ==
++        flight_zone_id_ &&
++        second_zone ==
++        flight_zone_id_ &&
++        first_uas ==
++        supervised &&
++        second_uas ==
++        counterpart)
++      {
++        output.valid =
++          true;
++        output.header =
++          pair.header;
++        output.supervised_position =
++          pair.first_position;
++        output.counterpart_position =
++          pair.second_position;
++        output.distance_xy_m =
++          pair.distance_xy_m;
++
++        return
++          std::isfinite(
++          output.distance_xy_m);
++      }
++
++      if (
++        first_zone ==
++        flight_zone_id_ &&
++        second_zone ==
++        flight_zone_id_ &&
++        first_uas ==
++        counterpart &&
++        second_uas ==
++        supervised)
++      {
++        output.valid =
++          true;
++        output.header =
++          pair.header;
++        output.supervised_position =
++          pair.second_position;
++        output.counterpart_position =
++          pair.first_position;
++        output.distance_xy_m =
++          pair.distance_xy_m;
++
++        return
++          std::isfinite(
++          output.distance_xy_m);
++      }
++    }
++
++    return false;
++  }
++
++
++  static const char * pair_mode_name(
++    PairMode mode)
+   {
+     switch (mode) {
+       case PairMode::MONITORING:
+         return "MONITORING";
++
+       case PairMode::WAITING_BOTH_PAUSE:
+         return "WAITING_BOTH_PAUSE";
++
+       case PairMode::WAITING_ELEVATE:
+         return "WAITING_ELEVATE";
++
+       case PairMode::WAITING_COUNTERPART_RESUME:
+         return "WAITING_COUNTERPART_RESUME";
++
+       case PairMode::COUNTERPART_RUNNING:
+         return "COUNTERPART_RUNNING";
++
+       case PairMode::WAITING_DESCEND:
+         return "WAITING_DESCEND";
++
+       case PairMode::WAITING_SUPERVISED_RESUME:
+         return "WAITING_SUPERVISED_RESUME";
++
+       case PairMode::CLEARED:
+         return "CLEARED";
++
+       default:
+         return "UNKNOWN";
+     }
+   }
+ 
++
+   void dispatch_active_trajectories_locked()
+   {
+-    for (const auto & [trajectory_id, active] : active_) {
+-      const std::string key = occurrence_key(active);
+-      if (execute_dispatched_.count(key) != 0U) {
++    for (
++      const auto & [trajectory_id, active] :
++      active_)
++    {
++      const std::string key =
++        occurrence_key(
++        active);
++
++      if (
++        execute_dispatched_.count(
++          key) != 0U)
++      {
+         continue;
+       }
+ 
+-      const auto supervised_it = supervised_.find(trajectory_id);
+-      if (supervised_it == supervised_.end()) {
++      const auto supervised_it =
++        supervised_.find(
++        trajectory_id);
++
++      if (
++        supervised_it ==
++        supervised_.end())
++      {
+         send_action_locked(
+           active.uas_namespace,
+           SupervisionControl::Goal::EXECUTE,
+           &active,
+           "active non-supervised trajectory",
+           key);
++
+         continue;
+       }
+ 
+-      // A supervised trajectory is executed using the ORIGINAL full trajectory
+-      // retained in /supervised_trajectories. The cropped version only exists in
+-      // the planning/available flow to reserve the non-conflicting resources.
++      // A supervised trajectory is executed using the ORIGINAL full
++      // trajectory retained in /supervised_trajectories. The cropped
++      // version only exists in the planning/available flow.
+       send_action_locked(
+-        supervised_it->second.trajectory.uas_namespace,
++        supervised_it->second.
++          trajectory.uas_namespace,
+         SupervisionControl::Goal::EXECUTE,
+         &supervised_it->second.trajectory,
+-        "active supervised trajectory: execute original full geometry",
++        "active supervised trajectory: "
++        "execute original full geometry",
+         key);
+     }
+   }
+ 
+-  std::set<std::string> counterpart_ids_for(const DetectedCollisionTrajectory & detected) const
++
++  std::set<std::string>
++  counterpart_ids_for(
++    const DetectedCollisionTrajectory &
++      detected) const
+   {
+     std::set<std::string> ids(
+-      detected.conflicting_trajectory_ids.begin(), detected.conflicting_trajectory_ids.end());
+-
+-    for (const auto & node : detected.collision_nodes) {
+-      ids.insert(node.conflicting_trajectory_ids.begin(), node.conflicting_trajectory_ids.end());
+-    }
+-    for (const auto & segment : detected.collision_segments) {
+-      ids.insert(segment.conflicting_trajectory_ids.begin(), segment.conflicting_trajectory_ids.end());
+-    }
+-
+-    ids.erase(detected.trajectory.trajectory_id);
++      detected.conflicting_trajectory_ids.begin(),
++      detected.conflicting_trajectory_ids.end());
++
++    for (
++      const auto & node :
++      detected.collision_nodes)
++    {
++      ids.insert(
++        node.conflicting_trajectory_ids.begin(),
++        node.conflicting_trajectory_ids.end());
++    }
++
++    for (
++      const auto & segment :
++      detected.collision_segments)
++    {
++      ids.insert(
++        segment.conflicting_trajectory_ids.begin(),
++        segment.conflicting_trajectory_ids.end());
++    }
++
++    ids.erase(
++      detected.trajectory.trajectory_id);
++
+     return ids;
+   }
+ 
++
+   void evaluate_supervised_pairs_locked()
+   {
+-    std::map<std::string, PairState> next_pairs;
+-
+-    for (const auto & [supervised_id, detected] : supervised_) {
++    std::map<std::string, PairState>
++      next_pairs;
++
++    for (
++      const auto & [supervised_id, detected] :
++      supervised_)
++    {
+       const auto supervised_active_it =
+-        active_.find(supervised_id);
+-
+-      if (supervised_active_it == active_.end()) {
++        active_.find(
++        supervised_id);
++
++      if (
++        supervised_active_it ==
++        active_.end())
++      {
+         continue;
+       }
+ 
+-      for (const auto & counterpart_id :
+-        counterpart_ids_for(detected))
++      for (
++        const auto & counterpart_id :
++        counterpart_ids_for(
++          detected))
+       {
+         const auto counterpart_active_it =
+-          active_.find(counterpart_id);
+-
+-        if (counterpart_active_it == active_.end()) {
++          active_.find(
++          counterpart_id);
++
++        if (
++          counterpart_active_it ==
++          active_.end())
++        {
+           continue;
+         }
+ 
+-        // This state machine is defined for one supervised trajectory versus
+-        // one non-supervised active counterpart.
+-        if (supervised_.find(counterpart_id) != supervised_.end()) {
++        // Same semantic restriction as the previous implementation:
++        // one supervised trajectory versus one non-supervised active
++        // counterpart.
++        if (
++          supervised_.find(
++            counterpart_id) !=
++          supervised_.end())
++        {
+           continue;
+         }
+ 
+@@ -809,18 +1693,21 @@
+ 
+         const std::string counterpart_uas =
+           trim_slashes(
+-          counterpart_active_it->second.uas_namespace);
++          counterpart_active_it->second.
++            uas_namespace);
+ 
+         if (
+           supervised_uas.empty() ||
+           counterpart_uas.empty() ||
+-          supervised_uas == counterpart_uas)
++          supervised_uas ==
++          counterpart_uas)
+         {
+           continue;
+         }
+ 
+         ensure_drone_context_locked(
+           supervised_uas);
++
+         ensure_drone_context_locked(
+           counterpart_uas);
+ 
+@@ -832,87 +1719,93 @@
+         PairState state;
+ 
+         const auto previous_it =
+-          pair_states_.find(pair_key);
+-
+-        if (previous_it != pair_states_.end()) {
+-          state = previous_it->second;
++          pair_states_.find(
++          pair_key);
++
++        if (
++          previous_it !=
++          pair_states_.end())
++        {
++          state =
++            previous_it->second;
+         }
+ 
+         state.supervised_trajectory_id =
+           supervised_id;
++
+         state.counterpart_trajectory_id =
+           counterpart_id;
++
+         state.supervised_uas =
+           supervised_uas;
++
+         state.counterpart_uas =
+           counterpart_uas;
+-        state.status_valid = false;
++
++        state.distance_valid =
++          false;
++
+         state.distance_xy_m =
+-          std::numeric_limits<double>::infinity();
+-
+-        const VehicleZoneStatus * supervised_status =
+-          nullptr;
+-        const VehicleZoneStatus * counterpart_status =
+-          nullptr;
+-
+-        const bool supervised_fresh =
+-          fresh_status_locked(
++          std::numeric_limits<double>::
++          infinity();
++
++        RelatedPairView related;
++
++        const bool distance_valid =
++          find_related_pair_locked(
+           supervised_uas,
+-          supervised_status);
+-
+-        const bool counterpart_fresh =
+-          fresh_status_locked(
+           counterpart_uas,
+-          counterpart_status);
+-
+-        const bool statuses_valid =
+-          supervised_fresh &&
+-          counterpart_fresh &&
+-          supervised_status != nullptr &&
+-          counterpart_status != nullptr &&
+-          trim_slashes(supervised_status->header.frame_id) ==
+-          trim_slashes(counterpart_status->header.frame_id);
+-
+-        if (statuses_valid) {
+-          state.status_valid = true;
++          related);
++
++        if (distance_valid) {
++          state.distance_valid =
++            true;
++
+           state.distance_xy_m =
+-            vehicle_xy_distance(
+-            *supervised_status,
+-            *counterpart_status);
++            related.distance_xy_m;
+         }
+ 
+-        // --------------------------------------------------------------
++        // ----------------------------------------------------------
+         // 0. MONITORING
+-        //
+-        // No command is sent until fresh positions in a common frame prove
+-        // that the XY separation is strictly below the pause threshold.
+-        // --------------------------------------------------------------
+-        if (state.mode == PairMode::MONITORING) {
++        // ----------------------------------------------------------
++        if (
++          state.mode ==
++          PairMode::MONITORING)
++        {
+           if (
+-            !statuses_valid ||
++            !distance_valid ||
+             state.distance_xy_m >=
+             pause_distance_xy_m_)
+           {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+-          state.reference_altitude_valid = true;
++          state.reference_altitude_valid =
++            true;
++
+           state.reference_z_m =
+-            supervised_status->position.z;
++            related.supervised_position.z;
++
+           state.reference_frame =
+             trim_slashes(
+-            supervised_status->header.frame_id);
++            related.header.frame_id);
+ 
+           state.mode =
+             PairMode::WAITING_BOTH_PAUSE;
+ 
+           RCLCPP_WARN(
+             get_logger(),
+-            "[/%s] XY deconfliction triggered for '%s' <-> '%s' | "
++            "[/%s] XY deconfliction triggered "
++            "for '%s' <-> '%s' | "
+             "distance_xy=%.3f m < %.3f m | "
+-            "PAUSE supervised UAS '%s' and counterpart UAS '%s' | "
+-            "reference_z=%.3f m",
++            "PAUSE supervised UAS '%s' and "
++            "counterpart UAS '%s' | "
++            "reference_z=%.3f m | "
++            "source='%s'",
+             flight_zone_id_.c_str(),
+             supervised_id.c_str(),
+             counterpart_id.c_str(),
+@@ -920,25 +1813,36 @@
+             pause_distance_xy_m_,
+             supervised_uas.c_str(),
+             counterpart_uas.c_str(),
+-            state.reference_z_m);
+-
+-          next_pairs[pair_key] = state;
++            state.reference_z_m,
++            related_distance_topic_.c_str());
++
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
+-        // 1. PAUSE BOTH UAS.
+-        // --------------------------------------------------------------
+-        if (state.mode == PairMode::WAITING_BOTH_PAUSE) {
++        // ----------------------------------------------------------
++        // 1. PAUSE BOTH UAS
++        // ----------------------------------------------------------
++        if (
++          state.mode ==
++          PairMode::WAITING_BOTH_PAUSE)
++        {
+           ensure_command_locked(
+             supervised_uas,
+             SupervisionControl::Goal::PAUSE,
+-            "XY separation below pause threshold: pause supervised UAS before vertical deconfliction");
++            "XY separation below pause threshold: "
++            "pause supervised UAS before "
++            "vertical deconfliction");
+ 
+           ensure_command_locked(
+             counterpart_uas,
+             SupervisionControl::Goal::PAUSE,
+-            "XY separation below pause threshold: pause non-supervised counterpart before vertical deconfliction");
++            "XY separation below pause threshold: "
++            "pause non-supervised counterpart "
++            "before vertical deconfliction");
+ 
+           const bool supervised_paused =
+             command_confirmed_locked(
+@@ -954,7 +1858,10 @@
+             !supervised_paused ||
+             !counterpart_paused)
+           {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+@@ -963,8 +1870,10 @@
+ 
+           RCLCPP_WARN(
+             get_logger(),
+-            "[/%s] Both UAS PAUSE commands acknowledged for pair '%s' <-> '%s'. "
+-            "Command ELEVATE=%u to supervised UAS '%s' (+%.3f m grid step).",
++            "[/%s] Both UAS PAUSE commands "
++            "acknowledged for pair '%s' <-> '%s'. "
++            "Command ELEVATE=%u to supervised "
++            "UAS '%s' (+%.3f m grid step).",
+             flight_zone_id_.c_str(),
+             supervised_id.c_str(),
+             counterpart_id.c_str(),
+@@ -973,36 +1882,45 @@
+             supervised_uas.c_str(),
+             vertical_grid_step_m_);
+ 
+-          next_pairs[pair_key] = state;
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
+-        // 2. ELEVATE SUPERVISED UAS.
++        // ----------------------------------------------------------
++        // 2. ELEVATE SUPERVISED UAS
+         //
+-        // The action result is an acknowledgement of the command. Physical
+-        // completion is independently verified through zone_status.position.z.
+-        // --------------------------------------------------------------
+-        if (state.mode == PairMode::WAITING_ELEVATE) {
++        // Action result acknowledges the command. Physical completion
++        // is independently verified using the supervised endpoint
++        // position already supplied in /uas_related_distance.
++        // ----------------------------------------------------------
++        if (
++          state.mode ==
++          PairMode::WAITING_ELEVATE)
++        {
+           ensure_command_locked(
+             supervised_uas,
+             SupervisionControl::Goal::ELEVATE,
+-            "vertical deconfliction: raise supervised UAS one grid step while mission remains paused");
++            "vertical deconfliction: raise "
++            "supervised UAS one grid step while "
++            "mission remains paused");
+ 
+           const bool elevate_ack =
+             command_confirmed_locked(
+             supervised_uas,
+             SupervisionControl::Goal::ELEVATE);
+ 
+-          bool elevated = false;
++          bool elevated =
++            false;
+ 
+           if (
+             elevate_ack &&
+             state.reference_altitude_valid &&
+-            supervised_fresh &&
+-            supervised_status != nullptr &&
++            distance_valid &&
+             trim_slashes(
+-              supervised_status->header.frame_id) ==
++              related.header.frame_id) ==
+             state.reference_frame)
+           {
+             const double target_z =
+@@ -1010,53 +1928,66 @@
+               vertical_grid_step_m_;
+ 
+             elevated =
+-              supervised_status->position.z >=
++              related.supervised_position.z >=
+               target_z -
+               vertical_position_tolerance_m_;
+           }
+ 
+           if (!elevated) {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+           state.mode =
+-            PairMode::WAITING_COUNTERPART_RESUME;
++            PairMode::
++            WAITING_COUNTERPART_RESUME;
+ 
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s] Supervised UAS '%s' elevated | z=%.3f m | "
+-            "reference_z=%.3f m | step=%.3f m. "
+-            "RESUME counterpart UAS '%s'.",
++            "[/%s] Supervised UAS '%s' elevated "
++            "| z=%.3f m | reference_z=%.3f m | "
++            "step=%.3f m. RESUME counterpart "
++            "UAS '%s'.",
+             flight_zone_id_.c_str(),
+             supervised_uas.c_str(),
+-            supervised_status->position.z,
++            related.supervised_position.z,
+             state.reference_z_m,
+             vertical_grid_step_m_,
+             counterpart_uas.c_str());
+ 
+-          next_pairs[pair_key] = state;
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
+-        // 3. RESUME NON-SUPERVISED COUNTERPART.
+-        // --------------------------------------------------------------
++        // ----------------------------------------------------------
++        // 3. RESUME NON-SUPERVISED COUNTERPART
++        // ----------------------------------------------------------
+         if (
+           state.mode ==
+-          PairMode::WAITING_COUNTERPART_RESUME)
++          PairMode::
++          WAITING_COUNTERPART_RESUME)
+         {
+           ensure_command_locked(
+             counterpart_uas,
+             SupervisionControl::Goal::RESUME,
+-            "supervised UAS is elevated: resume non-supervised counterpart");
++            "supervised UAS is elevated: "
++            "resume non-supervised counterpart");
+ 
+           if (
+             !command_confirmed_locked(
+               counterpart_uas,
+               SupervisionControl::Goal::RESUME))
+           {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+@@ -1065,30 +1996,35 @@
+ 
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s] Counterpart UAS '%s' RESUME acknowledged for pair '%s' <-> '%s'. "
+-            "Monitor XY separation until > %.3f m.",
++            "[/%s] Counterpart UAS '%s' RESUME "
++            "acknowledged for pair '%s' <-> '%s'. "
++            "Monitor /uas_related_distance until "
++            "distance_xy > %.3f m.",
+             flight_zone_id_.c_str(),
+             counterpart_uas.c_str(),
+             supervised_id.c_str(),
+             counterpart_id.c_str(),
+             release_distance_xy_m_);
+ 
+-          next_pairs[pair_key] = state;
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
+-        // 4. MONITOR ONLY THE RUNNING COUNTERPART.
+-        //
+-        // No vertical distance is used here. The supervised UAS remains
+-        // elevated and its mission stays paused.
+-        // --------------------------------------------------------------
++        // ----------------------------------------------------------
++        // 4. MONITOR RUNNING COUNTERPART
++        // ----------------------------------------------------------
+         if (
+           state.mode ==
+           PairMode::COUNTERPART_RUNNING)
+         {
+-          if (!statuses_valid) {
+-            next_pairs[pair_key] = state;
++          if (!distance_valid) {
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+@@ -1096,7 +2032,10 @@
+             state.distance_xy_m <=
+             release_distance_xy_m_)
+           {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+@@ -1105,9 +2044,10 @@
+ 
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s] Counterpart '%s' cleared pair '%s' | "
+-            "distance_xy=%.3f m > %.3f m. "
+-            "Stop counterpart supervision and command DESCEND=%u to supervised UAS '%s'.",
++            "[/%s] Counterpart '%s' cleared "
++            "pair '%s' | distance_xy=%.3f m > "
++            "%.3f m. Command DESCEND=%u to "
++            "supervised UAS '%s'.",
+             flight_zone_id_.c_str(),
+             counterpart_id.c_str(),
+             pair_key.c_str(),
+@@ -1117,13 +2057,16 @@
+               SupervisionControl::Goal::DESCEND),
+             supervised_uas.c_str());
+ 
+-          next_pairs[pair_key] = state;
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
+-        // 5. DESCEND SUPERVISED UAS TO ITS CAPTURED ALTITUDE.
+-        // --------------------------------------------------------------
++        // ----------------------------------------------------------
++        // 5. DESCEND SUPERVISED UAS
++        // ----------------------------------------------------------
+         if (
+           state.mode ==
+           PairMode::WAITING_DESCEND)
+@@ -1131,70 +2074,86 @@
+           ensure_command_locked(
+             supervised_uas,
+             SupervisionControl::Goal::DESCEND,
+-            "counterpart XY separation is clear: return supervised UAS to its pre-elevation altitude");
++            "counterpart XY separation is clear: "
++            "return supervised UAS to its "
++            "pre-elevation altitude");
+ 
+           const bool descend_ack =
+             command_confirmed_locked(
+             supervised_uas,
+             SupervisionControl::Goal::DESCEND);
+ 
+-          bool restored = false;
++          bool restored =
++            false;
+ 
+           if (
+             descend_ack &&
+             state.reference_altitude_valid &&
+-            supervised_fresh &&
+-            supervised_status != nullptr &&
++            distance_valid &&
+             trim_slashes(
+-              supervised_status->header.frame_id) ==
++              related.header.frame_id) ==
+             state.reference_frame)
+           {
+             restored =
+               std::abs(
+-              supervised_status->position.z -
++              related.supervised_position.z -
+               state.reference_z_m) <=
+               vertical_position_tolerance_m_;
+           }
+ 
+           if (!restored) {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+           state.mode =
+-            PairMode::WAITING_SUPERVISED_RESUME;
++            PairMode::
++            WAITING_SUPERVISED_RESUME;
+ 
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s] Supervised UAS '%s' restored to previous altitude | "
+-            "z=%.3f m | reference_z=%.3f m. RESUME supervised trajectory.",
++            "[/%s] Supervised UAS '%s' restored "
++            "to previous altitude | z=%.3f m | "
++            "reference_z=%.3f m. "
++            "RESUME supervised trajectory.",
+             flight_zone_id_.c_str(),
+             supervised_uas.c_str(),
+-            supervised_status->position.z,
++            related.supervised_position.z,
+             state.reference_z_m);
+ 
+-          next_pairs[pair_key] = state;
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
+-        // 6. RESUME SUPERVISED TRAJECTORY.
+-        // --------------------------------------------------------------
++        // ----------------------------------------------------------
++        // 6. RESUME SUPERVISED TRAJECTORY
++        // ----------------------------------------------------------
+         if (
+           state.mode ==
+-          PairMode::WAITING_SUPERVISED_RESUME)
++          PairMode::
++          WAITING_SUPERVISED_RESUME)
+         {
+           ensure_command_locked(
+             supervised_uas,
+             SupervisionControl::Goal::RESUME,
+-            "vertical deconfliction complete: resume supervised trajectory");
++            "vertical deconfliction complete: "
++            "resume supervised trajectory");
+ 
+           if (
+             !command_confirmed_locked(
+               supervised_uas,
+               SupervisionControl::Goal::RESUME))
+           {
+-            next_pairs[pair_key] = state;
++            next_pairs[
++              pair_key] =
++              state;
++
+             continue;
+           }
+ 
+@@ -1203,294 +2162,838 @@
+ 
+           RCLCPP_INFO(
+             get_logger(),
+-            "[/%s] Pair '%s' <-> '%s' deconflicted completely. "
+-            "Supervised UAS resumed; no further supervision is applied to this pair.",
++            "[/%s] Pair '%s' <-> '%s' "
++            "deconflicted completely. "
++            "Supervised UAS resumed; no further "
++            "supervision is applied to this pair.",
+             flight_zone_id_.c_str(),
+             supervised_id.c_str(),
+             counterpart_id.c_str());
+ 
+-          next_pairs[pair_key] = state;
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+ 
+-        // --------------------------------------------------------------
++        // ----------------------------------------------------------
+         // 7. CLEARED
+-        // --------------------------------------------------------------
+-        if (state.mode == PairMode::CLEARED) {
+-          next_pairs[pair_key] = state;
++        // ----------------------------------------------------------
++        if (
++          state.mode ==
++          PairMode::CLEARED)
++        {
++          next_pairs[
++            pair_key] =
++            state;
++
+           continue;
+         }
+       }
+     }
+ 
+     pair_states_ =
+-      std::move(next_pairs);
+-  }
++      std::move(
++      next_pairs);
++  }
++
+ 
+   static void append_segment_edges(
+     std::vector<geometry_msgs::msg::Point> & out,
+     const TrajectorySegment & segment)
+   {
+-    const std::size_t count = point_count(segment);
++    const std::size_t count =
++      point_count(
++      segment);
++
+     if (count < 2U) {
+       return;
+     }
+ 
+-    for (std::size_t i = 1U; i < count; ++i) {
+-      out.push_back(point_at(segment, i - 1U));
+-      out.push_back(point_at(segment, i));
+-    }
+-  }
+-
+-  static std::vector<geometry_msgs::msg::Point>
++    for (
++      std::size_t i = 1U;
++      i < count;
++      ++i)
++    {
++      out.push_back(
++        point_at(
++          segment,
++          i - 1U));
++
++      out.push_back(
++        point_at(
++          segment,
++          i));
++    }
++  }
++
++
++  static std::vector<
++    geometry_msgs::msg::Point>
+   trajectory_line_list_points(
+     const StaticTrajectory & trajectory)
+   {
+-    std::vector<geometry_msgs::msg::Point> out;
+-
+-    // Every trajectory component is an independent polyline. In particular,
+-    // never add an implicit edge between mission[i] and mission[i+1].
+-    append_segment_edges(out, trajectory.takeoff);
+-
+-    for (const auto & mission : trajectory.mission) {
+-      append_segment_edges(out, mission);
+-    }
+-
+-    append_segment_edges(out, trajectory.landing);
++    std::vector<
++      geometry_msgs::msg::Point>
++      out;
++
++    // Every trajectory component is an independent polyline.
++    // Never invent connectors between takeoff, mission[i],
++    // mission[i+1] or landing.
++    append_segment_edges(
++      out,
++      trajectory.takeoff);
++
++    for (
++      const auto & mission :
++      trajectory.mission)
++    {
++      append_segment_edges(
++        out,
++        mission);
++    }
++
++    append_segment_edges(
++      out,
++      trajectory.landing);
++
+     return out;
+   }
+ 
+-  MarkerArray make_markers_locked() const
+-  {
+-    MarkerArray out;
+-    Marker clear;
+-    clear.header.stamp = now();
+-    clear.header.frame_id = latest_header_.frame_id;
+-    clear.action = Marker::DELETEALL;
+-    out.markers.push_back(clear);
+-
+-    int marker_id = 1;
+-
+-    for (const auto & [trajectory_id, active] : active_) {
+-      const bool supervised_active = supervised_.find(trajectory_id) != supervised_.end();
+-      const StaticTrajectory * displayed = &active;
+-      if (supervised_active) {
+-        displayed = &supervised_.at(trajectory_id).trajectory;
+-      }
+-
+-      const auto points = trajectory_line_list_points(*displayed);
+-      if (points.size() >= 2U) {
+-        Marker line;
+-        line.header.stamp = now();
+-        line.header.frame_id = displayed->frame_id;
+-        line.ns = supervised_active ? "supervision/active_supervised" : "supervision/active_normal";
+-        line.id = marker_id++;
+-        line.type = Marker::LINE_LIST;
+-        line.action = Marker::ADD;
+-        line.pose.orientation.w = 1.0;
+-        line.scale.x = trajectory_line_width_;
+-        line.color = supervised_active ? color(1.0F, 0.55F, 0.0F, 1.0F) : color(0.10F, 0.85F, 0.25F, 1.0F);
+-        line.points = points;
+-        out.markers.push_back(std::move(line));
+-      }
+-    }
+-
+-    for (const auto & [trajectory_id, detected] : supervised_) {
+-      if (active_.find(trajectory_id) == active_.end()) {
+-        continue;
+-      }
+-
+-      for (const auto & node : detected.collision_nodes) {
+-        Marker sphere;
+-        sphere.header.stamp = now();
+-        sphere.header.frame_id = detected.trajectory.frame_id;
+-        sphere.ns = "supervision/collision_nodes";
+-        sphere.id = marker_id++;
+-        sphere.type = Marker::SPHERE;
+-        sphere.action = Marker::ADD;
+-        sphere.pose.orientation.w = 1.0;
+-        sphere.pose.position = node.position;
+-        sphere.scale.x = collision_node_scale_;
+-        sphere.scale.y = collision_node_scale_;
+-        sphere.scale.z = collision_node_scale_;
+-        sphere.color = color(1.0F, 0.10F, 0.05F, 1.0F);
+-        out.markers.push_back(std::move(sphere));
+-      }
+-
+-      for (const auto & segment : detected.collision_segments) {
+-        Marker line;
+-        line.header.stamp = now();
+-        line.header.frame_id = detected.trajectory.frame_id;
+-        line.ns = "supervision/collision_segments";
+-        line.id = marker_id++;
+-        line.type = Marker::LINE_LIST;
+-        line.action = Marker::ADD;
+-        line.pose.orientation.w = 1.0;
+-        line.scale.x = collision_segment_width_;
+-        line.color = color(1.0F, 0.05F, 0.05F, 1.0F);
+-        line.points.push_back(segment.start);
+-        line.points.push_back(segment.end);
+-        out.markers.push_back(std::move(line));
+-      }
+-    }
+-
+-    for (const auto & [uas, drone] : drones_) {
+-      if (!drone.status_received) {
+-        continue;
+-      }
+-      Marker sphere;
+-      sphere.header = drone.last_status.header;
+-      sphere.header.stamp = now();
+-      sphere.ns = "supervision/drones";
+-      sphere.id = marker_id++;
+-      sphere.type = Marker::SPHERE;
+-      sphere.action = Marker::ADD;
+-      sphere.pose.orientation.w = 1.0;
+-      sphere.pose.position = drone.last_status.position;
+-      sphere.scale.x = drone_scale_;
+-      sphere.scale.y = drone_scale_;
+-      sphere.scale.z = drone_scale_;
+-      sphere.color = drone.last_control_command == static_cast<int>(SupervisionControl::Goal::PAUSE) ?
+-        color(0.95F, 0.10F, 0.80F, 1.0F) : color(0.20F, 0.65F, 1.0F, 1.0F);
+-      out.markers.push_back(std::move(sphere));
+-
+-      Marker text;
+-      text.header = drone.last_status.header;
+-      text.header.stamp = now();
+-      text.ns = "supervision/drone_labels";
+-      text.id = marker_id++;
+-      text.type = Marker::TEXT_VIEW_FACING;
+-      text.action = Marker::ADD;
+-      text.pose.orientation.w = 1.0;
+-      text.pose.position = drone.last_status.position;
+-      text.pose.position.z += drone_scale_;
+-      text.scale.z = text_height_;
+-      text.color = color(1.0F, 1.0F, 1.0F, 1.0F);
+-      std::string command_label;
+-      if (drone.last_control_command == static_cast<int>(SupervisionControl::Goal::PAUSE)) {
+-        command_label = " | PAUSE";
+-      } else if (drone.last_control_command == static_cast<int>(SupervisionControl::Goal::RESUME)) {
+-        command_label = " | RESUME";
+-      } else if (drone.last_control_command == static_cast<int>(SupervisionControl::Goal::ELEVATE)) {
+-        command_label = " | ELEVATE";
+-      } else if (drone.last_control_command == static_cast<int>(SupervisionControl::Goal::DESCEND)) {
+-        command_label = " | DESCEND";
+-      }
+-
+-      text.text = uas + command_label;
+-      out.markers.push_back(std::move(text));
+-    }
+-
+-    for (const auto & [_, pair] : pair_states_) {
+-      const auto first_it = drones_.find(pair.supervised_uas);
+-      const auto second_it = drones_.find(pair.counterpart_uas);
+-      if (first_it == drones_.end() || second_it == drones_.end() ||
+-        !first_it->second.status_received || !second_it->second.status_received)
++
++  bool uas_has_active_trajectory_locked(
++    const std::string & uas_namespace,
++    bool & supervised_active) const
++  {
++    const std::string uas =
++      trim_slashes(
++      uas_namespace);
++
++    supervised_active =
++      false;
++
++    bool active_found =
++      false;
++
++    for (
++      const auto & [trajectory_id, trajectory] :
++      active_)
++    {
++      if (
++        trim_slashes(
++          trajectory.uas_namespace) !=
++        uas)
+       {
+         continue;
+       }
+ 
++      active_found =
++        true;
++
++      if (
++        supervised_.find(
++          trajectory_id) !=
++        supervised_.end())
++      {
++        supervised_active =
++          true;
++      }
++    }
++
++    return active_found;
++  }
++
++
++  std::string uas_runtime_state_locked(
++    const std::string & uas_namespace) const
++  {
++    const std::string uas =
++      trim_slashes(
++      uas_namespace);
++
++    bool supervised_active =
++      false;
++
++    const bool active =
++      uas_has_active_trajectory_locked(
++      uas,
++      supervised_active);
++
++    std::string state =
++      active ?
++      (
++        supervised_active ?
++        "ACTIVE_SUPERVISED" :
++        "ACTIVE"
++      ) :
++      "SUPERVISED_WAITING";
++
++    // Pair mode has priority because it expresses the deconfliction state
++    // that the operator actually needs to see in RViz2.
++    for (
++      const auto & [_, pair] :
++      pair_states_)
++    {
++      if (
++        pair.supervised_uas ==
++        uas)
++      {
++        switch (pair.mode) {
++          case PairMode::MONITORING:
++            state =
++              "SUPERVISED_MONITORING";
++            break;
++
++          case PairMode::WAITING_BOTH_PAUSE:
++            state =
++              "SUPERVISED_PAUSE_PENDING";
++            break;
++
++          case PairMode::WAITING_ELEVATE:
++            state =
++              "SUPERVISED_PAUSED_WAIT_ELEVATE";
++            break;
++
++          case PairMode::WAITING_COUNTERPART_RESUME:
++            state =
++              "SUPERVISED_ELEVATED";
++            break;
++
++          case PairMode::COUNTERPART_RUNNING:
++            state =
++              "SUPERVISED_ELEVATED_HOLD";
++            break;
++
++          case PairMode::WAITING_DESCEND:
++            state =
++              "SUPERVISED_DESCEND_PENDING";
++            break;
++
++          case PairMode::WAITING_SUPERVISED_RESUME:
++            state =
++              "SUPERVISED_RESTORED_WAIT_RESUME";
++            break;
++
++          case PairMode::CLEARED:
++            state =
++              "SUPERVISED_RESUMED_CLEARED";
++            break;
++        }
++
++        return state;
++      }
++
++      if (
++        pair.counterpart_uas ==
++        uas)
++      {
++        switch (pair.mode) {
++          case PairMode::MONITORING:
++            state =
++              "COUNTERPART_MONITORING";
++            break;
++
++          case PairMode::WAITING_BOTH_PAUSE:
++            state =
++              "COUNTERPART_PAUSE_PENDING";
++            break;
++
++          case PairMode::WAITING_ELEVATE:
++            state =
++              "COUNTERPART_PAUSED";
++            break;
++
++          case PairMode::WAITING_COUNTERPART_RESUME:
++            state =
++              "COUNTERPART_RESUME_PENDING";
++            break;
++
++          case PairMode::COUNTERPART_RUNNING:
++            state =
++              "COUNTERPART_RUNNING";
++            break;
++
++          case PairMode::WAITING_DESCEND:
++          case PairMode::WAITING_SUPERVISED_RESUME:
++          case PairMode::CLEARED:
++            state =
++              "COUNTERPART_CLEAR_RUNNING";
++            break;
++        }
++
++        return state;
++      }
++    }
++
++    return state;
++  }
++
++
++  std_msgs::msg::ColorRGBA
++  uas_state_color_locked(
++    const std::string & uas_namespace) const
++  {
++    const std::string state =
++      uas_runtime_state_locked(
++      uas_namespace);
++
++    if (
++      state.find("PAUSE") !=
++      std::string::npos)
++    {
++      return
++        color(
++        0.95F,
++        0.10F,
++        0.80F,
++        1.0F);
++    }
++
++    if (
++      state.find("ELEVATED") !=
++      std::string::npos)
++    {
++      return
++        color(
++        1.0F,
++        0.55F,
++        0.0F,
++        1.0F);
++    }
++
++    if (
++      state.find("DESCEND") !=
++      std::string::npos)
++    {
++      return
++        color(
++        0.75F,
++        0.30F,
++        1.0F,
++        1.0F);
++    }
++
++    if (
++      state.find("CLEARED") !=
++      std::string::npos ||
++      state.find("CLEAR_RUNNING") !=
++      std::string::npos)
++    {
++      return
++        color(
++        0.10F,
++        0.90F,
++        0.20F,
++        1.0F);
++    }
++
++    if (
++      state.find("SUPERVISED") !=
++      std::string::npos)
++    {
++      return
++        color(
++        1.0F,
++        0.75F,
++        0.10F,
++        1.0F);
++    }
++
++    return
++      color(
++      0.20F,
++      0.65F,
++      1.0F,
++      1.0F);
++  }
++
++
++  MarkerArray make_markers_locked() const
++  {
++    MarkerArray out;
++
++    Marker clear;
++    clear.header.stamp =
++      now();
++
++    clear.header.frame_id =
++      latest_header_.frame_id;
++
++    clear.action =
++      Marker::DELETEALL;
++
++    out.markers.push_back(
++      clear);
++
++    int marker_id =
++      1;
++
++    // --------------------------------------------------------------
++    // Trajectory geometry for ACTIVE trajectories.
++    // --------------------------------------------------------------
++    for (
++      const auto & [trajectory_id, active] :
++      active_)
++    {
++      const bool supervised_active =
++        supervised_.find(
++          trajectory_id) !=
++        supervised_.end();
++
++      const StaticTrajectory * displayed =
++        &active;
++
++      if (supervised_active) {
++        displayed =
++          &supervised_.at(
++          trajectory_id).trajectory;
++      }
++
++      const auto points =
++        trajectory_line_list_points(
++        *displayed);
++
++      if (
++        points.size() >=
++        2U)
++      {
++        Marker line;
++        line.header.stamp =
++          now();
++        line.header.frame_id =
++          displayed->frame_id;
++        line.ns =
++          supervised_active ?
++          "supervision/active_supervised" :
++          "supervision/active_normal";
++        line.id =
++          marker_id++;
++        line.type =
++          Marker::LINE_LIST;
++        line.action =
++          Marker::ADD;
++        line.pose.orientation.w =
++          1.0;
++        line.scale.x =
++          trajectory_line_width_;
++        line.color =
++          supervised_active ?
++          color(
++            1.0F,
++            0.55F,
++            0.0F,
++            1.0F) :
++          color(
++            0.10F,
++            0.85F,
++            0.25F,
++            1.0F);
++        line.points =
++          points;
++
++        out.markers.push_back(
++          std::move(
++            line));
++      }
++    }
++
++    // --------------------------------------------------------------
++    // Static collision evidence for active supervised trajectories.
++    // --------------------------------------------------------------
++    for (
++      const auto & [trajectory_id, detected] :
++      supervised_)
++    {
++      if (
++        active_.find(
++          trajectory_id) ==
++        active_.end())
++      {
++        continue;
++      }
++
++      for (
++        const auto & node :
++        detected.collision_nodes)
++      {
++        Marker sphere;
++        sphere.header.stamp =
++          now();
++        sphere.header.frame_id =
++          detected.trajectory.frame_id;
++        sphere.ns =
++          "supervision/collision_nodes";
++        sphere.id =
++          marker_id++;
++        sphere.type =
++          Marker::SPHERE;
++        sphere.action =
++          Marker::ADD;
++        sphere.pose.orientation.w =
++          1.0;
++        sphere.pose.position =
++          node.position;
++        sphere.scale.x =
++          collision_node_scale_;
++        sphere.scale.y =
++          collision_node_scale_;
++        sphere.scale.z =
++          collision_node_scale_;
++        sphere.color =
++          color(
++          1.0F,
++          0.10F,
++          0.05F,
++          1.0F);
++
++        out.markers.push_back(
++          std::move(
++            sphere));
++      }
++
++      for (
++        const auto & segment :
++        detected.collision_segments)
++      {
++        Marker line;
++        line.header.stamp =
++          now();
++        line.header.frame_id =
++          detected.trajectory.frame_id;
++        line.ns =
++          "supervision/collision_segments";
++        line.id =
++          marker_id++;
++        line.type =
++          Marker::LINE_LIST;
++        line.action =
++          Marker::ADD;
++        line.pose.orientation.w =
++          1.0;
++        line.scale.x =
++          collision_segment_width_;
++        line.color =
++          color(
++          1.0F,
++          0.05F,
++          0.05F,
++          1.0F);
++        line.points.push_back(
++          segment.start);
++        line.points.push_back(
++          segment.end);
++
++        out.markers.push_back(
++          std::move(
++            line));
++      }
++    }
++
++    // --------------------------------------------------------------
++    // One state marker for every tracked UAS belonging to this zone.
++    // Position comes only from /uas_related_distance.
++    // --------------------------------------------------------------
++    for (
++      const auto & [uas, drone] :
++      drones_)
++    {
++      PositionSample position;
++
++      if (
++        !fresh_position_locked(
++          uas,
++          position))
++      {
++        continue;
++      }
++
++      Marker sphere;
++      sphere.header =
++        position.header;
++      sphere.header.stamp =
++        now();
++      sphere.ns =
++        "supervision/drone_states";
++      sphere.id =
++        marker_id++;
++      sphere.type =
++        Marker::SPHERE;
++      sphere.action =
++        Marker::ADD;
++      sphere.pose.orientation.w =
++        1.0;
++      sphere.pose.position =
++        position.position;
++      sphere.scale.x =
++        drone_scale_;
++      sphere.scale.y =
++        drone_scale_;
++      sphere.scale.z =
++        drone_scale_;
++      sphere.color =
++        uas_state_color_locked(
++        uas);
++
++      out.markers.push_back(
++        std::move(
++          sphere));
++
++      Marker text;
++      text.header =
++        position.header;
++      text.header.stamp =
++        now();
++      text.ns =
++        "supervision/drone_state_labels";
++      text.id =
++        marker_id++;
++      text.type =
++        Marker::TEXT_VIEW_FACING;
++      text.action =
++        Marker::ADD;
++      text.pose.orientation.w =
++        1.0;
++      text.pose.position =
++        position.position;
++      text.pose.position.z +=
++        drone_scale_;
++      text.scale.z =
++        text_height_;
++      text.color =
++        color(
++        1.0F,
++        1.0F,
++        1.0F,
++        1.0F);
++
++      std::ostringstream label;
++      label
++        << uas
++        << " | "
++        << uas_runtime_state_locked(
++          uas)
++        << " | cmd="
++        << command_name(
++          drone.last_control_command)
++        << " | ack="
++        << command_name(
++          drone.last_confirmed_control_command);
++
++      if (
++        drone.control_command_in_flight)
++      {
++        label
++          << " | IN_FLIGHT";
++      }
++
++      text.text =
++        label.str();
++
++      out.markers.push_back(
++        std::move(
++          text));
++    }
++
++    // --------------------------------------------------------------
++    // Pair supervision state markers.
++    // --------------------------------------------------------------
++    for (
++      const auto & [_, pair] :
++      pair_states_)
++    {
++      RelatedPairView related;
++
++      const bool distance_valid =
++        find_related_pair_locked(
++        pair.supervised_uas,
++        pair.counterpart_uas,
++        related);
++
++      if (!distance_valid) {
++        continue;
++      }
++
+       Marker link;
+-      link.header = first_it->second.last_status.header;
+-      link.header.stamp = now();
+-      link.ns = "supervision/security_links";
+-      link.id = marker_id++;
+-      link.type = Marker::LINE_LIST;
+-      link.action = Marker::ADD;
+-      link.pose.orientation.w = 1.0;
+-      link.scale.x = 0.06;
+-      if (pair.mode == PairMode::MONITORING) {
+-        link.color =
+-          pair.status_valid &&
+-          pair.distance_xy_m >= pause_distance_xy_m_ ?
+-          color(0.10F, 0.90F, 0.20F, 1.0F) :
+-          color(1.0F, 0.10F, 0.10F, 1.0F);
+-      } else if (pair.mode == PairMode::CLEARED) {
+-        link.color =
+-          color(0.10F, 0.90F, 0.20F, 1.0F);
+-      } else if (
+-        pair.mode == PairMode::COUNTERPART_RUNNING)
++      link.header =
++        related.header;
++      link.header.stamp =
++        now();
++      link.ns =
++        "supervision/security_links";
++      link.id =
++        marker_id++;
++      link.type =
++        Marker::LINE_LIST;
++      link.action =
++        Marker::ADD;
++      link.pose.orientation.w =
++        1.0;
++      link.scale.x =
++        pair_line_width_;
++
++      if (
++        pair.mode ==
++        PairMode::MONITORING)
+       {
+         link.color =
+-          color(1.0F, 0.55F, 0.0F, 1.0F);
++          related.distance_xy_m >=
++          pause_distance_xy_m_ ?
++          color(
++            0.10F,
++            0.90F,
++            0.20F,
++            1.0F) :
++          color(
++            1.0F,
++            0.10F,
++            0.10F,
++            1.0F);
++      } else if (
++        pair.mode ==
++        PairMode::CLEARED)
++      {
++        link.color =
++          color(
++          0.10F,
++          0.90F,
++          0.20F,
++          1.0F);
++      } else if (
++        pair.mode ==
++        PairMode::COUNTERPART_RUNNING)
++      {
++        link.color =
++          color(
++          1.0F,
++          0.55F,
++          0.0F,
++          1.0F);
+       } else {
+         link.color =
+-          color(1.0F, 0.0F, 0.75F, 1.0F);
++          color(
++          1.0F,
++          0.0F,
++          0.75F,
++          1.0F);
+       }
+-      link.points.push_back(first_it->second.last_status.position);
+-      link.points.push_back(second_it->second.last_status.position);
+-      out.markers.push_back(std::move(link));
++
++      link.points.push_back(
++        related.supervised_position);
++
++      link.points.push_back(
++        related.counterpart_position);
++
++      out.markers.push_back(
++        std::move(
++          link));
+ 
+       Marker text;
+-      text.header = first_it->second.last_status.header;
+-      text.header.stamp = now();
+-      text.ns = "supervision/security_pair_labels";
+-      text.id = marker_id++;
+-      text.type = Marker::TEXT_VIEW_FACING;
+-      text.action = Marker::ADD;
+-      text.pose.orientation.w = 1.0;
++      text.header =
++        related.header;
++      text.header.stamp =
++        now();
++      text.ns =
++        "supervision/security_pair_labels";
++      text.id =
++        marker_id++;
++      text.type =
++        Marker::TEXT_VIEW_FACING;
++      text.action =
++        Marker::ADD;
++      text.pose.orientation.w =
++        1.0;
++
+       text.pose.position.x =
+-        0.5 * (
+-        first_it->second.last_status.position.x +
+-        second_it->second.last_status.position.x);
++        0.5 *
++        (
++        related.supervised_position.x +
++        related.counterpart_position.x);
++
+       text.pose.position.y =
+-        0.5 * (
+-        first_it->second.last_status.position.y +
+-        second_it->second.last_status.position.y);
++        0.5 *
++        (
++        related.supervised_position.y +
++        related.counterpart_position.y);
++
+       text.pose.position.z =
+-        0.5 * (
+-        first_it->second.last_status.position.z +
+-        second_it->second.last_status.position.z) +
++        0.5 *
++        (
++        related.supervised_position.z +
++        related.counterpart_position.z) +
+         text_height_;
+-      text.scale.z = text_height_;
+-      text.color = color(1.0F, 1.0F, 1.0F, 1.0F);
++
++      text.scale.z =
++        text_height_;
++
++      text.color =
++        color(
++        1.0F,
++        1.0F,
++        1.0F,
++        1.0F);
+ 
+       std::ostringstream pair_label;
+-      pair_label << pair_mode_name(pair.mode);
+-
+-      if (pair.status_valid) {
+-        pair_label
+-          << " | d_xy="
+-          << pair.distance_xy_m
+-          << " m";
+-      }
+-
+-      if (pair.reference_altitude_valid) {
++
++      pair_label
++        << pair_mode_name(
++          pair.mode)
++        << " | d_xy="
++        << related.distance_xy_m
++        << " m";
++
++      if (
++        pair.reference_altitude_valid)
++      {
+         pair_label
+           << " | z_ref="
+           << pair.reference_z_m
+           << " m";
+       }
+ 
+-      text.text = pair_label.str();
+-
+-      out.markers.push_back(std::move(text));
++      text.text =
++        pair_label.str();
++
++      out.markers.push_back(
++        std::move(
++          text));
+     }
+ 
+     return out;
+   }
+ 
++
+   void evaluate()
+   {
+-    std::lock_guard<std::mutex> lock(mutex_);
++    std::lock_guard<std::mutex>
++      lock(mutex_);
++
+     dispatch_active_trajectories_locked();
++
+     evaluate_supervised_pairs_locked();
+-    marker_publisher_->publish(make_markers_locked());
+-  }
++
++    marker_publisher_->publish(
++      make_markers_locked());
++  }
++
+ 
+   std::string flight_zone_id_;
++
+   std::string available_topic_;
+   std::string supervised_topic_;
+   std::string active_topic_;
+-  std::string zone_status_suffix_;
++  std::string related_distance_topic_;
++
+   std::string control_action_suffix_;
+   std::string markers_topic_;
+ 
+   double pause_distance_xy_m_{1.5};
+   double release_distance_xy_m_{2.0};
++
+   double vertical_grid_step_m_{1.0};
+   double vertical_position_tolerance_m_{0.15};
+-  double zone_status_timeout_s_{2.0};
++
++  double related_distance_timeout_s_{2.0};
+ 
+   int evaluation_period_ms_{100};
+   int action_wait_timeout_ms_{20};
+@@ -1499,37 +3002,109 @@
+   double collision_segment_width_{0.20};
+   double collision_node_scale_{0.34};
+   double drone_scale_{0.42};
++  double pair_line_width_{0.06};
+   double text_height_{0.30};
+ 
+   mutable std::mutex mutex_;
++
+   std_msgs::msg::Header latest_header_;
+ 
+-  std::map<std::string, StaticTrajectory> available_;
+-  std::map<std::string, DetectedCollisionTrajectory> supervised_;
+-  std::map<std::string, StaticTrajectory> active_;
+-  std::map<std::string, DroneContext> drones_;
+-  std::map<std::string, PairState> pair_states_;
+-  std::set<std::string> execute_dispatched_;
+-
+-  rclcpp::Subscription<StaticTrajectoryArray>::SharedPtr available_subscription_;
+-  rclcpp::Subscription<DetectedCollisionTrajectoryArray>::SharedPtr supervised_subscription_;
+-  rclcpp::Subscription<StaticTrajectoryArray>::SharedPtr active_subscription_;
+-  rclcpp::Publisher<MarkerArray>::SharedPtr marker_publisher_;
+-  rclcpp::TimerBase::SharedPtr evaluation_timer_;
++  std::map<
++    std::string,
++    StaticTrajectory>
++    available_;
++
++  std::map<
++    std::string,
++    DetectedCollisionTrajectory>
++    supervised_;
++
++  std::map<
++    std::string,
++    StaticTrajectory>
++    active_;
++
++  std::map<
++    std::string,
++    DroneContext>
++    drones_;
++
++  std::map<
++    std::string,
++    PairState>
++    pair_states_;
++
++  std::set<std::string>
++    execute_dispatched_;
++
++  bool latest_related_distance_received_{false};
++
++  UasRelatedDistanceArray
++    latest_related_distance_;
++
++  std::chrono::steady_clock::time_point
++    latest_related_distance_at_{};
++
++  std::map<
++    std::string,
++    PositionSample>
++    positions_;
++
++  rclcpp::Subscription<
++    StaticTrajectoryArray>::SharedPtr
++    available_subscription_;
++
++  rclcpp::Subscription<
++    DetectedCollisionTrajectoryArray>::SharedPtr
++    supervised_subscription_;
++
++  rclcpp::Subscription<
++    StaticTrajectoryArray>::SharedPtr
++    active_subscription_;
++
++  rclcpp::Subscription<
++    UasRelatedDistanceArray>::SharedPtr
++    related_distance_subscription_;
++
++  rclcpp::Publisher<
++    MarkerArray>::SharedPtr
++    marker_publisher_;
++
++  rclcpp::TimerBase::SharedPtr
++    evaluation_timer_;
+ };
+ 
+ }  // namespace flight_zone_supervision
+ 
+-int main(int argc, char ** argv)
++
++int main(
++  int argc,
++  char ** argv)
+ {
+-  rclcpp::init(argc, argv);
++  rclcpp::init(
++    argc,
++    argv);
++
+   try {
+-    rclcpp::spin(std::make_shared<flight_zone_supervision::SupervisionNode>());
+-  } catch (const std::exception & error) {
+-    RCLCPP_FATAL(rclcpp::get_logger("supervision_node"), "Fatal error: %s", error.what());
++    rclcpp::spin(
++      std::make_shared<
++        flight_zone_supervision::
++        SupervisionNode>());
++  } catch (
++    const std::exception & error)
++  {
++    RCLCPP_FATAL(
++      rclcpp::get_logger(
++        "supervision_node"),
++      "Fatal error: %s",
++      error.what());
++
+     rclcpp::shutdown();
++
+     return 1;
+   }
++
+   rclcpp::shutdown();
++
+   return 0;
+ }

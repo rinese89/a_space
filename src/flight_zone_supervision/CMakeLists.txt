@@ -8,13 +8,16 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
+
+find_package(rosidl_default_generators REQUIRED)
+
+find_package(collision_detection REQUIRED)
+find_package(distance_control REQUIRED)
+find_package(static_trajectory_manager REQUIRED)
+
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(flight_zone_msgs REQUIRED)
-find_package(static_trajectory_manager REQUIRED)
-find_package(collision_detection REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/SupervisionControl.action"
@@ -22,27 +25,57 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     static_trajectory_manager
 )
 
-add_executable(supervision_node src/supervision_node.cpp)
-ament_target_dependencies(supervision_node
+add_executable(supervision_node
+  src/supervision_node.cpp
+)
+
+target_compile_features(
+  supervision_node
+  PUBLIC
+    cxx_std_17
+)
+
+ament_target_dependencies(
+  supervision_node
   rclcpp
   rclcpp_action
+  collision_detection
+  distance_control
+  static_trajectory_manager
   geometry_msgs
   std_msgs
   visualization_msgs
-  flight_zone_msgs
-  static_trajectory_manager
-  collision_detection
 )
 
-target_compile_features(supervision_node PUBLIC cxx_std_17)
+rosidl_get_typesupport_target(
+  cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
 
-rosidl_get_typesupport_target(cpp_typesupport_target
-  ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(supervision_node "${cpp_typesupport_target}")
+target_link_libraries(
+  supervision_node
+  "${cpp_typesupport_target}"
+)
 
-install(TARGETS supervision_node DESTINATION lib/${PROJECT_NAME})
-install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
-install(FILES README.md DESTINATION share/${PROJECT_NAME})
+install(
+  TARGETS
+    supervision_node
+  DESTINATION
+    lib/${PROJECT_NAME}
+)
 
-ament_export_dependencies(rosidl_default_runtime)
+install(
+  DIRECTORY
+    action
+    config
+    launch
+  DESTINATION
+    share/${PROJECT_NAME}
+)
+
+ament_export_dependencies(
+  rosidl_default_runtime
+)
+
 ament_package()

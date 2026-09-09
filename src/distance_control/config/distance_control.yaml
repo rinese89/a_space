@@ -1,0 +1,11 @@
+/**:
+  ros__parameters:
+    active_trajectories_topic: /active_trajectories
+    zone_status_suffix: zone_status
+    related_distance_topic: /uas_related_distance
+    zone_status_timeout_s: 2.0
+    evaluation_period_ms: 100
+    markers_topic: /uas_related_distance/markers
+    drone_scale: 0.42
+    pair_line_width: 0.06
+    text_height: 0.30

@@ -4,44 +4,38 @@
     supervised_trajectories_topic: /supervised_trajectories
     active_trajectories_topic: /active_trajectories
 
-    zone_status_suffix: zone_status
+    # Produced by distance_control_node.
+    related_distance_topic: /uas_related_distance
+
     control_action_suffix: supervision_control
 
-    # Activation gate:
-    # UAS-to-UAS safety-distance supervision remains dormant until the UAS
-    # executing the supervised trajectory is at most this distance from ANY
-    # stored collision segment. Once armed for a pair it remains latched until
-    # that pair disappears.
-    collision_monitor_activation_distance_m: 3.0
+    # Runtime deconfliction thresholds.
+    # Trigger strictly when distance_xy < 1.5 m.
+    pause_distance_xy_m: 1.5
 
-    # Phase 1:
-    # Once the activation gate has armed, normal PAUSE/RESUME supervision is
-    # applied using the UAS-to-UAS safety distance below.
-    security_distance_m: 3.0
-    use_3d_distance: true
-    zone_status_timeout_s: 2.0
+    # Clear strictly when distance_xy > 2.0 m.
+    release_distance_xy_m: 2.0
 
-    # Escalation criterion:
-    # While the supervised UAS is paused inside the security distance, the
-    # separation must increase by at least this amount within this window.
-    # Otherwise the non-supervised counterpart is paused and the supervised UAS
-    # is resumed so it can clear the original collision section.
-    distance_progress_timeout_s: 0.5
-    distance_progress_epsilon_m: 0.05
+    # Used only to verify the physical ELEVATE/DESCEND state using the
+    # positions already included in /uas_related_distance.
+    vertical_grid_step_m: 1.0
+    vertical_position_tolerance_m: 0.15
 
-    # Phase 2:
-    # The counterpart remains PAUSED until the supervised UAS position is more
-    # than (distance + hysteresis) away from every collision node/segment stored
-    # in /supervised_trajectories.
-    collision_exit_distance_m: 1.0
-    collision_exit_hysteresis_m: 0.20
+    # If the latest /uas_related_distance snapshot is older than this,
+    # no pair state transition depending on geometry is allowed.
+    related_distance_timeout_s: 2.0
 
     evaluation_period_ms: 100
     action_wait_timeout_ms: 20
 
+    # Relative topic: because the node runs under /<flight_zone>,
+    # the effective topic is /<flight_zone>/supervision_markers.
     markers_topic: supervision_markers
+
     trajectory_line_width: 0.10
     collision_segment_width: 0.20
     collision_node_scale: 0.34
+
     drone_scale: 0.42
+    pair_line_width: 0.06
     text_height: 0.30

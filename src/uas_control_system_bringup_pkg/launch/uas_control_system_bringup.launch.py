@@ -148,13 +148,23 @@ def _control_manager_settings(
             f"El YAML '{source_path}' debe contener '/**/ros__parameters'."
         )
 
-    # Defaults match control_manager_pkg 0.3.x multi-mission configuration.
-    return {
+    # Defaults match control_manager_pkg 0.4.x:
+    # multi-mission execution + vertical deconfliction commands.
+    settings = {
+        "tick_period_ms": int(
+            params.get("tick_period_ms", 100)
+        ),
         "retry_period_ms": int(
             params.get("retry_period_ms", 500)
         ),
+        "action_wait_timeout_ms": int(
+            params.get("action_wait_timeout_ms", 50)
+        ),
         "max_start_lateness_s": float(
             params.get("max_start_lateness_s", 5.0)
+        ),
+        "vertical_grid_step_m": float(
+            params.get("vertical_grid_step_m", 1.0)
         ),
         "supervision_action_suffix": str(
             params.get(
@@ -175,6 +185,33 @@ def _control_manager_settings(
             )
         ),
     }
+
+    if settings["tick_period_ms"] <= 0:
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene tick_period_ms <= 0."
+        )
+
+    if settings["retry_period_ms"] <= 0:
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene retry_period_ms <= 0."
+        )
+
+    if settings["action_wait_timeout_ms"] < 0:
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene action_wait_timeout_ms < 0."
+        )
+
+    if settings["max_start_lateness_s"] < 0.0:
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene max_start_lateness_s < 0."
+        )
+
+    if settings["vertical_grid_step_m"] <= 0.0:
+        raise RuntimeError(
+            f"El YAML '{source_path}' contiene vertical_grid_step_m <= 0."
+        )
+
+    return settings
 
 
 def _write_runtime_yaml(data: Dict[str, Any], stem: str) -> str:
@@ -302,7 +339,11 @@ def _launch_setup(context, *_args, **_kwargs):
                 f"arm_retry_period={controller_takeoff['arm_retry_period_s']:.2f}s | "
                 f"ground_settle={controller_takeoff['ground_settle_s']:.2f}s | "
                 f"takeoff_max_retries={controller_takeoff['max_retries']} | "
-                f"control_manager_retry={control_manager_settings['retry_period_ms']}ms"
+                f"control_manager_tick={control_manager_settings['tick_period_ms']}ms | "
+                f"control_manager_retry={control_manager_settings['retry_period_ms']}ms | "
+                f"vertical_grid_step={control_manager_settings['vertical_grid_step_m']:.2f}m | "
+                "supervision_commands="
+                "EXECUTE=0,PAUSE=1,RESUME=2,ELEVATE=3,DESCEND=4,STOP=5"
             )
         ),
         IncludeLaunchDescription(
@@ -330,12 +371,21 @@ def _launch_setup(context, *_args, **_kwargs):
                 "flight_zone_id": flight_zone_id,
             }.items(),
         ),
-        # control_manager_node current A-space contract:
+        # control_manager_node current A-space contract (0.4.x):
         # - does not subscribe directly to /active_trajectories;
-        # - receives EXECUTE / PAUSE / RESUME / STOP through SupervisionControl;
+        # - receives SupervisionControl:
+        #     EXECUTE=0, PAUSE=1, RESUME=2,
+        #     ELEVATE=3, DESCEND=4, STOP=5;
         # - executes StaticTrajectory.mission[] component-by-component;
         # - repeats the complete mission[] collection according to repetitions;
+        # - preserves repetition/mission/waypoint across PAUSE and the auxiliary
+        #   vertical ELEVATE/DESCEND maneuver;
+        # - ELEVATE moves one vertical_grid_step_m while the mission is paused;
+        # - DESCEND returns to the stored pre-elevation vertical reference;
         # - retries FollowWaypoints until control_waypoints reaches HOLD.
+        #
+        # The vertical_grid_step_m value is a ROS parameter from
+        # control_manager_config_file, not a separate child-launch argument.
         #
         # Action server:
         #   /<flight_zone>/<uas_namespace>/supervision_control
@@ -397,8 +447,9 @@ def generate_launch_description():
                     package_share, "config", "control_manager.yaml"
                 ),
                 description=(
-                    "Configuración actual del control_manager_node "
-                    "(multi-mission + SupervisionControl)."
+                    "Configuración actual del control_manager_node 0.4.x: "
+                    "multi-mission, SupervisionControl y deconflicción vertical "
+                    "(vertical_grid_step_m; ELEVATE=3/DESCEND=4)."
                 ),
             ),
             OpaqueFunction(function=_launch_setup),

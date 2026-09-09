@@ -1,14 +1,17 @@
-# Command contract between /<flight_zone>/supervision_node and a per-UAS control_manager_node.
+# Command contract between /<flight_zone>/supervision_node and a per-UAS
+# control_manager_node.
 
 uint8 EXECUTE=0
 uint8 PAUSE=1
 uint8 RESUME=2
-uint8 STOP=3
+uint8 ELEVATE=3
+uint8 DESCEND=4
+uint8 STOP=5
 
 uint8 command
 
 # EXECUTE: normally exactly one trajectory.
-# PAUSE/RESUME/STOP: may be empty.
+# PAUSE/RESUME/ELEVATE/DESCEND/STOP: may be empty.
 static_trajectory_manager/StaticTrajectoryArray trajectories
 
 string reason

@@ -1,28 +1,35 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>flight_zone_supervision</name>
-  <version>0.4.0</version>
-  <description>Per-flight-zone multi-mission supervision with collision-segment proximity activation, UAS safety-distance control, escalation and counterpart hold until collision clearance.</description>
+  <version>0.6.0</version>
+
+  <description>
+    Flight-zone runtime supervision using pairwise UAS distances supplied by
+    distance_control_node.
+  </description>
+
   <maintainer email="maintainer@example.com">A-space</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+
   <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
 
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>
+
+  <depend>collision_detection</depend>
+  <depend>distance_control</depend>
+  <depend>static_trajectory_manager</depend>
+
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>visualization_msgs</depend>
-  <depend>flight_zone_msgs</depend>
-  <depend>static_trajectory_manager</depend>
-  <depend>collision_detection</depend>
-
-  <exec_depend>rosidl_default_runtime</exec_depend>
-  <exec_depend>launch</exec_depend>
-  <exec_depend>launch_ros</exec_depend>
-  <exec_depend>ament_index_python</exec_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>
-  <export><build_type>ament_cmake</build_type></export>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

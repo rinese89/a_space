@@ -1,0 +1,7 @@
+--- a/src/distance_control_node.cpp
++++ b/src/distance_control_node.cpp
+@@
+-  UasRelatedDistanceArray make_distance_snapshot_locked() const
++  UasRelatedDistanceArray make_distance_snapshot_locked()
+   {
+     UasRelatedDistanceArray out;

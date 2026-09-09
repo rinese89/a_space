@@ -70,6 +70,10 @@ enum class State : uint8_t
   MISSION_ACTIVE,
   PAUSE_CANCELING,
   PAUSED,
+  VERTICAL_ELEVATE_DISPATCH,
+  VERTICAL_ELEVATE_ACTIVE,
+  VERTICAL_DESCEND_DISPATCH,
+  VERTICAL_DESCEND_ACTIVE,
   STOP_CANCELING,
   RETURN_DISPATCH,
   RETURN_ACTIVE,
@@ -83,7 +87,16 @@ enum class ActionPurpose : uint8_t
 {
   NONE,
   MISSION,
+  VERTICAL_ELEVATE,
+  VERTICAL_DESCEND,
   RETURN_TO_LANDING
+};
+
+enum class VerticalIntent : uint8_t
+{
+  NONE,
+  ELEVATE,
+  DESCEND
 };
 
 enum class CancelIntent : uint8_t
@@ -175,6 +188,10 @@ public:
     max_start_lateness_s_ = declare_parameter<double>("max_start_lateness_s", 5.0);
     transform_timeout_s_ = declare_parameter<double>("transform_timeout_s", 0.20);
 
+    // Vertical grid step used by SupervisionControl::ELEVATE/DESCEND.
+    // It must match supervision_node.vertical_grid_step_m.
+    vertical_grid_step_m_ = declare_parameter<double>("vertical_grid_step_m", 1.0);
+
     max_path_deviation_m_ = declare_parameter<double>("max_path_deviation_m", 1.0);
     deviation_grace_period_s_ = declare_parameter<double>("deviation_grace_period_s", 1.0);
     deviation_hold_time_s_ = declare_parameter<double>("deviation_hold_time_s", 0.75);
@@ -226,14 +243,16 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "Control manager ready | UAS='/%s' | supervision action='%s' | "
-      "controller service='/%s/%s' | follow action='%s' | operator service='/%s/%s'",
+      "controller service='/%s/%s' | follow action='%s' | operator service='/%s/%s' | "
+      "vertical_grid_step=%.3f m",
       drone_namespace_.c_str(),
       supervision_action_name_.c_str(),
       drone_namespace_.c_str(),
       arm_takeoff_service_suffix_.c_str(),
       expected_action_name_.c_str(),
       drone_namespace_.c_str(),
-      operator_service_suffix_.c_str());
+      operator_service_suffix_.c_str(),
+      vertical_grid_step_m_);
   }
 
 private:
@@ -272,7 +291,8 @@ private:
 
     if (tick_period_ms_ <= 0 || retry_period_ms_ <= 0 || service_wait_timeout_ms_ < 0 ||
       action_wait_timeout_ms_ < 0 || max_start_lateness_s_ < 0.0 || transform_timeout_s_ < 0.0 ||
-      !finite(service_yaw_rad_) ||
+      !finite(service_yaw_rad_) || !finite(vertical_grid_step_m_) ||
+      vertical_grid_step_m_ <= 0.0 ||
       max_path_deviation_m_ <= 0.0 || deviation_grace_period_s_ < 0.0 ||
       deviation_hold_time_s_ < 0.0 || max_completed_keys_ < 1)
     {
@@ -413,6 +433,8 @@ private:
       case SupervisionControl::Goal::EXECUTE:
       case SupervisionControl::Goal::PAUSE:
       case SupervisionControl::Goal::RESUME:
+      case SupervisionControl::Goal::ELEVATE:
+      case SupervisionControl::Goal::DESCEND:
       case SupervisionControl::Goal::STOP:
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 
@@ -429,8 +451,9 @@ private:
   rclcpp_action::CancelResponse handle_supervision_cancel(
     const std::shared_ptr<GoalHandleSupervisionControl>)
   {
-    // SupervisionControl goals are short command transactions. Flight
-    // cancellation is requested explicitly through PAUSE or STOP.
+    // SupervisionControl goals are short command transactions. Flight/action
+    // cancellation is requested explicitly through PAUSE or STOP. ELEVATE and
+    // DESCEND are acquired here and executed asynchronously by this node.
     return rclcpp_action::CancelResponse::REJECT;
   }
 
@@ -467,6 +490,14 @@ private:
 
       case SupervisionControl::Goal::RESUME:
         accepted = request_supervision_resume(message);
+        break;
+
+      case SupervisionControl::Goal::ELEVATE:
+        accepted = request_supervision_elevate(message);
+        break;
+
+      case SupervisionControl::Goal::DESCEND:
+        accepted = request_supervision_descend(message);
         break;
 
       case SupervisionControl::Goal::STOP:
@@ -686,6 +717,14 @@ private:
           "trajectory is already paused or pause is in progress";
         return true;
 
+      case State::VERTICAL_ELEVATE_DISPATCH:
+      case State::VERTICAL_ELEVATE_ACTIVE:
+      case State::VERTICAL_DESCEND_DISPATCH:
+      case State::VERTICAL_DESCEND_ACTIVE:
+        message =
+          "mission is already paused; a supervision vertical maneuver is in progress";
+        return true;
+
       default:
         message =
           std::string(
@@ -723,8 +762,15 @@ private:
         return true;
 
       case State::PAUSED:
+        if (vertical_elevated_) {
+          message =
+            "RESUME rejected while the UAS is elevated; DESCEND must restore the pre-elevation altitude first";
+          return false;
+        }
+
         pending_pause_request_ = false;
         resume_after_pause_ = false;
+        resume_after_vertical_ = false;
         state_ =
           State::MISSION_DISPATCH;
         next_attempt_at_ =
@@ -734,6 +780,12 @@ private:
         return true;
 
       case State::PAUSE_CANCELING:
+        if (pending_vertical_intent_ != VerticalIntent::NONE) {
+          message =
+            "RESUME rejected because a supervision vertical maneuver is queued after PAUSE";
+          return false;
+        }
+
         resume_after_pause_ = true;
         pending_pause_request_ = false;
         message =
@@ -769,6 +821,19 @@ private:
         }
         return true;
 
+      case State::VERTICAL_ELEVATE_DISPATCH:
+      case State::VERTICAL_ELEVATE_ACTIVE:
+        message =
+          "RESUME rejected while the UAS is elevating/elevated; DESCEND is required before mission resume";
+        return false;
+
+      case State::VERTICAL_DESCEND_DISPATCH:
+      case State::VERTICAL_DESCEND_ACTIVE:
+        resume_after_vertical_ = true;
+        message =
+          "resume queued; mission will continue after DESCEND reaches the stored pre-elevation position";
+        return true;
+
       case State::WAITING_START:
       case State::TAKEOFF_REQUEST:
       case State::MISSION_DISPATCH:
@@ -781,6 +846,187 @@ private:
         message =
           std::string(
           "RESUME is not valid while state=") +
+          state_name(state_);
+        return false;
+    }
+  }
+
+  bool capture_vertical_reference(
+    std::string & message)
+  {
+    if (vertical_reference_map_) {
+      return true;
+    }
+
+    if (!last_feedback_map_) {
+      message =
+        "cannot capture vertical reference: no valid mission feedback pose is available";
+      return false;
+    }
+
+    vertical_reference_map_ =
+      *last_feedback_map_;
+
+    if (
+      !finite(vertical_reference_map_->x) ||
+      !finite(vertical_reference_map_->y) ||
+      !finite(vertical_reference_map_->z))
+    {
+      vertical_reference_map_.reset();
+      message =
+        "cannot capture vertical reference: latest feedback pose is non-finite";
+      return false;
+    }
+
+    RCLCPP_INFO(
+      get_logger(),
+      "[/%s] Captured vertical reference in trajectory frame '%s': "
+      "(%.3f, %.3f, %.3f)",
+      drone_namespace_.c_str(),
+      active_trajectory_ ?
+      active_trajectory_->frame_id.c_str() :
+      "",
+      vertical_reference_map_->x,
+      vertical_reference_map_->y,
+      vertical_reference_map_->z);
+
+    return true;
+  }
+
+  bool request_supervision_elevate(
+    std::string & message)
+  {
+    if (!active_trajectory_) {
+      message =
+        "ELEVATE requires an acquired trajectory";
+      return false;
+    }
+
+    if (vertical_elevated_) {
+      message =
+        "UAS is already elevated by supervision; ELEVATE treated as idempotent";
+      return true;
+    }
+
+    switch (state_) {
+      case State::MISSION_ACTIVE:
+        if (!pending_pause_request_) {
+          message =
+            "ELEVATE requires PAUSE first; mission is still active";
+          return false;
+        }
+
+        pending_vertical_intent_ =
+          VerticalIntent::ELEVATE;
+        message =
+          "ELEVATE queued; it will start after the in-flight PAUSE cancellation reaches HOLD";
+        return true;
+
+      case State::PAUSE_CANCELING:
+        pending_vertical_intent_ =
+          VerticalIntent::ELEVATE;
+        message =
+          "ELEVATE queued; it will start immediately after PAUSE cancellation reaches HOLD";
+        return true;
+
+      case State::PAUSED:
+      {
+        if (!capture_vertical_reference(message)) {
+          return false;
+        }
+
+        pending_vertical_intent_ =
+          VerticalIntent::NONE;
+        resume_after_vertical_ = false;
+        state_ =
+          State::VERTICAL_ELEVATE_DISPATCH;
+        next_attempt_at_ =
+          std::chrono::steady_clock::now();
+
+        std::ostringstream stream;
+        stream
+          << "ELEVATE accepted; dispatching +"
+          << vertical_grid_step_m_
+          << " m from stored reference z="
+          << vertical_reference_map_->z;
+        message =
+          stream.str();
+        return true;
+      }
+
+      case State::VERTICAL_ELEVATE_DISPATCH:
+      case State::VERTICAL_ELEVATE_ACTIVE:
+        message =
+          "ELEVATE is already pending/in progress";
+        return true;
+
+      case State::VERTICAL_DESCEND_DISPATCH:
+      case State::VERTICAL_DESCEND_ACTIVE:
+        message =
+          "ELEVATE rejected while DESCEND is pending/in progress";
+        return false;
+
+      default:
+        message =
+          std::string(
+          "ELEVATE is only valid after mission PAUSE; current state=") +
+          state_name(state_);
+        return false;
+    }
+  }
+
+  bool request_supervision_descend(
+    std::string & message)
+  {
+    if (!active_trajectory_) {
+      message =
+        "DESCEND requires an acquired trajectory";
+      return false;
+    }
+
+    switch (state_) {
+      case State::VERTICAL_ELEVATE_DISPATCH:
+      case State::VERTICAL_ELEVATE_ACTIVE:
+        pending_vertical_intent_ =
+          VerticalIntent::DESCEND;
+        message =
+          "DESCEND queued; it will start after ELEVATE finishes";
+        return true;
+
+      case State::PAUSED:
+        if (!vertical_elevated_) {
+          message =
+            "DESCEND rejected: there is no active supervision elevation to restore";
+          return false;
+        }
+
+        if (!vertical_reference_map_) {
+          message =
+            "DESCEND rejected: stored pre-elevation reference is unavailable";
+          return false;
+        }
+
+        pending_vertical_intent_ =
+          VerticalIntent::NONE;
+        state_ =
+          State::VERTICAL_DESCEND_DISPATCH;
+        next_attempt_at_ =
+          std::chrono::steady_clock::now();
+
+        message =
+          "DESCEND accepted; returning to stored pre-elevation position";
+        return true;
+
+      case State::VERTICAL_DESCEND_DISPATCH:
+      case State::VERTICAL_DESCEND_ACTIVE:
+        message =
+          "DESCEND is already pending/in progress";
+        return true;
+
+      default:
+        message =
+          std::string(
+          "DESCEND is only valid while the supervised mission is paused and elevated; current state=") +
           state_name(state_);
         return false;
     }
@@ -813,6 +1059,9 @@ private:
     }
 
     resume_after_pause_ = false;
+    resume_after_vertical_ = false;
+    pending_vertical_intent_ =
+      VerticalIntent::NONE;
     pending_stop_request_ = true;
     message =
       "total stop requested";
@@ -1047,7 +1296,8 @@ private:
     return best;
   }
 
-  void process_mission_feedback(const FollowWaypoints::Feedback & feedback)
+  void process_mission_feedback(
+    const FollowWaypoints::Feedback & feedback)
   {
     current_mission_waypoint_ =
       std::min<std::size_t>(
@@ -1058,26 +1308,50 @@ private:
       0U :
       mission_path_map_.size() - 1U);
 
-    const auto now_steady = std::chrono::steady_clock::now();
-    if (now_steady - mission_started_at_ < std::chrono::duration<double>(deviation_grace_period_s_)) {
-      return;
-    }
-
     const Point3 feedback_odom{
       feedback.pose.position.x,
       feedback.pose.position.y,
       feedback.pose.position.z};
-    if (!finite(feedback_odom.x) || !finite(feedback_odom.y) || !finite(feedback_odom.z)) {
+
+    if (
+      !finite(feedback_odom.x) ||
+      !finite(feedback_odom.y) ||
+      !finite(feedback_odom.z))
+    {
       return;
     }
+
+    // Keep the latest real mission pose independently from path-deviation
+    // monitoring. Supervision ELEVATE captures this position after PAUSE and
+    // later DESCEND returns to it without touching the mission cursor.
+    last_feedback_odom_ =
+      feedback_odom;
 
     Point3 feedback_map;
     if (!feedback_position_to_map(feedback_odom, feedback_map)) {
       return;
     }
 
-    const double distance = distance_to_mission_path(feedback_map);
-    last_path_deviation_m_ = distance;
+    last_feedback_map_ =
+      feedback_map;
+
+    const auto now_steady =
+      std::chrono::steady_clock::now();
+
+    if (
+      now_steady - mission_started_at_ <
+      std::chrono::duration<double>(
+        deviation_grace_period_s_))
+    {
+      return;
+    }
+
+    const double distance =
+      distance_to_mission_path(
+      feedback_map);
+
+    last_path_deviation_m_ =
+      distance;
 
     if (distance <= max_path_deviation_m_) {
       deviation_active_ = false;
@@ -1086,27 +1360,41 @@ private:
 
     if (!deviation_active_) {
       deviation_active_ = true;
-      deviation_started_at_ = now_steady;
+      deviation_started_at_ =
+        now_steady;
+
       RCLCPP_WARN(
         get_logger(),
         "[/%s] Path deviation detected | trajectory='%s' | repetition=%u | "
         "mission=%zu | distance=%.3f m | limit=%.3f m",
         drone_namespace_.c_str(),
-        active_trajectory_->trajectory_id.c_str(),
+        active_trajectory_->
+        trajectory_id.c_str(),
         current_repetition_,
         current_mission_index_,
         distance,
         max_path_deviation_m_);
+
       return;
     }
 
-    const double duration = std::chrono::duration<double>(now_steady - deviation_started_at_).count();
-    if (duration >= deviation_hold_time_s_ && !pending_stop_request_) {
+    const double duration =
+      std::chrono::duration<double>(
+      now_steady -
+      deviation_started_at_).count();
+
+    if (
+      duration >= deviation_hold_time_s_ &&
+      !pending_stop_request_)
+    {
       pending_stop_request_ = true;
+
       RCLCPP_ERROR(
         get_logger(),
         "[/%s] Sustained path deviation %.3f m for %.2f s -> TOTAL STOP",
-        drone_namespace_.c_str(), distance, duration);
+        drone_namespace_.c_str(),
+        distance,
+        duration);
     }
   }
 
@@ -1131,8 +1419,25 @@ private:
           // goal whose cancellation was rejected. Restore the active state and
           // keep the operator request pending so the next supervision tick
           // retries the cancellation.
-          state_ = action_purpose_ == ActionPurpose::RETURN_TO_LANDING ?
-            State::RETURN_ACTIVE : State::MISSION_ACTIVE;
+          switch (action_purpose_) {
+            case ActionPurpose::VERTICAL_ELEVATE:
+              state_ =
+                State::VERTICAL_ELEVATE_ACTIVE;
+              break;
+            case ActionPurpose::VERTICAL_DESCEND:
+              state_ =
+                State::VERTICAL_DESCEND_ACTIVE;
+              break;
+            case ActionPurpose::RETURN_TO_LANDING:
+              state_ =
+                State::RETURN_ACTIVE;
+              break;
+            case ActionPurpose::MISSION:
+            default:
+              state_ =
+                State::MISSION_ACTIVE;
+              break;
+          }
           cancel_intent_ = CancelIntent::NONE;
 
           if (resume_after_pause_) {
@@ -1223,14 +1528,25 @@ private:
       });
   }
 
-  void send_action(ActionPurpose purpose)
+  void send_action(
+    ActionPurpose purpose)
   {
     if (!active_trajectory_) {
-      fail("no active trajectory for action request");
+      fail(
+        "no active trajectory for action request");
       return;
     }
-    if (!follow_waypoints_client_->wait_for_action_server(std::chrono::milliseconds(action_wait_timeout_ms_))) {
-      next_attempt_at_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(retry_period_ms_);
+
+    if (
+      !follow_waypoints_client_->
+      wait_for_action_server(
+        std::chrono::milliseconds(
+          action_wait_timeout_ms_)))
+    {
+      next_attempt_at_ =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(
+        retry_period_ms_);
       return;
     }
 
@@ -1255,9 +1571,11 @@ private:
 
       if (base_index >= mission_path_map_.size()) {
         if (advance_to_next_mission_component()) {
-          state_ = State::MISSION_DISPATCH;
+          state_ =
+            State::MISSION_DISPATCH;
         } else {
-          state_ = State::LANDING_REQUEST;
+          state_ =
+            State::LANDING_REQUEST;
         }
 
         next_attempt_at_ =
@@ -1268,11 +1586,13 @@ private:
       goal.x.reserve(
         mission_path_map_.size() -
         base_index);
+
       goal.y.reserve(
         mission_path_map_.size() -
         base_index);
 
-      for (std::size_t i = base_index;
+      for (
+        std::size_t i = base_index;
         i < mission_path_map_.size();
         ++i)
       {
@@ -1282,35 +1602,143 @@ private:
           mission_path_map_[i].y);
       }
 
-      // Each mission[i] has already been validated to have one constant scalar
-      // Z, so each component may be dispatched with its own FollowWaypoints
-      // height.
       goal.height =
         mission->z.front();
+
       goal.goal_tolerance =
-        active_trajectory_->goal_tolerance;
+        active_trajectory_->
+        goal_tolerance;
+
       goal.slowdown_radius =
-        active_trajectory_->slowdown_radius;
-      goal.repetitions = 1U;
+        active_trajectory_->
+        slowdown_radius;
+
+      goal.repetitions =
+        1U;
+    } else if (
+      purpose ==
+      ActionPurpose::VERTICAL_ELEVATE ||
+      purpose ==
+      ActionPurpose::VERTICAL_DESCEND)
+    {
+      if (!vertical_reference_map_) {
+        std::string reason;
+        if (
+          purpose ==
+          ActionPurpose::VERTICAL_ELEVATE &&
+          !capture_vertical_reference(
+            reason))
+        {
+          RCLCPP_WARN(
+            get_logger(),
+            "[/%s] Cannot dispatch ELEVATE: %s; retrying",
+            drone_namespace_.c_str(),
+            reason.c_str());
+
+          next_attempt_at_ =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+            retry_period_ms_);
+          return;
+        }
+
+        if (!vertical_reference_map_) {
+          RCLCPP_ERROR(
+            get_logger(),
+            "[/%s] Cannot dispatch DESCEND: vertical reference is unavailable",
+            drone_namespace_.c_str());
+
+          state_ =
+            State::PAUSED;
+          return;
+        }
+      }
+
+      const double target_z =
+        purpose ==
+        ActionPurpose::VERTICAL_ELEVATE ?
+        vertical_reference_map_->z +
+        vertical_grid_step_m_ :
+        vertical_reference_map_->z;
+
+      // FollowWaypoints goals use the same trajectory/map coordinate contract
+      // as normal mission goals. A one-point goal is sufficient for a pure
+      // vertical displacement while keeping X/Y fixed.
+      goal.x = {
+        vertical_reference_map_->x};
+      goal.y = {
+        vertical_reference_map_->y};
+      goal.height =
+        target_z;
+      goal.goal_tolerance =
+        active_trajectory_->
+        goal_tolerance;
+      goal.slowdown_radius =
+        active_trajectory_->
+        slowdown_radius;
+      goal.repetitions =
+        1U;
+      base_index =
+        0U;
+
+      RCLCPP_INFO_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        1000,
+        "[/%s] Dispatching %s auxiliary goal | reference=(%.3f, %.3f, %.3f) | "
+        "target_z=%.3f | mission cursor preserved repetition=%u mission=%zu waypoint=%zu",
+        drone_namespace_.c_str(),
+        purpose ==
+        ActionPurpose::VERTICAL_ELEVATE ?
+        "ELEVATE" :
+        "DESCEND",
+        vertical_reference_map_->x,
+        vertical_reference_map_->y,
+        vertical_reference_map_->z,
+        target_z,
+        current_repetition_,
+        current_mission_index_,
+        current_mission_waypoint_);
     } else {
-      const auto & landing = active_trajectory_->landing;
-      const Point3 landing_entry{landing.x.front(), landing.y.front(), landing.z.front()};
+      const auto & landing =
+        active_trajectory_->landing;
+
+      const Point3 landing_entry{
+        landing.x.front(),
+        landing.y.front(),
+        landing.z.front()};
+
       if (landing_entry.z <= 0.0) {
-        state_ = State::LANDING_REQUEST;
-        next_attempt_at_ = std::chrono::steady_clock::now();
+        state_ =
+          State::LANDING_REQUEST;
+        next_attempt_at_ =
+          std::chrono::steady_clock::now();
         return;
       }
-      goal.x = {landing_entry.x};
-      goal.y = {landing_entry.y};
-      goal.height = landing_entry.z;
-      goal.goal_tolerance = active_trajectory_->goal_tolerance;
-      goal.slowdown_radius = active_trajectory_->slowdown_radius;
-      goal.repetitions = 1U;
-      base_index = 0U;
+
+      goal.x = {
+        landing_entry.x};
+      goal.y = {
+        landing_entry.y};
+      goal.height =
+        landing_entry.z;
+      goal.goal_tolerance =
+        active_trajectory_->
+        goal_tolerance;
+      goal.slowdown_radius =
+        active_trajectory_->
+        slowdown_radius;
+      goal.repetitions =
+        1U;
+      base_index =
+        0U;
     }
 
-    action_purpose_ = purpose;
-    action_base_index_ = base_index;
+    action_purpose_ =
+      purpose;
+
+    action_base_index_ =
+      base_index;
 
     if (purpose == ActionPurpose::MISSION) {
       action_mission_index_ =
@@ -1320,24 +1748,98 @@ private:
     }
 
     const std::string trajectory_id =
-      active_trajectory_->trajectory_id;
+      active_trajectory_->
+      trajectory_id;
 
-    rclcpp_action::Client<FollowWaypoints>::SendGoalOptions options;
+    auto dispatch_state =
+      [purpose]() -> State {
+        switch (purpose) {
+          case ActionPurpose::MISSION:
+            return State::MISSION_DISPATCH;
+          case ActionPurpose::VERTICAL_ELEVATE:
+            return State::VERTICAL_ELEVATE_DISPATCH;
+          case ActionPurpose::VERTICAL_DESCEND:
+            return State::VERTICAL_DESCEND_DISPATCH;
+          case ActionPurpose::RETURN_TO_LANDING:
+            return State::RETURN_DISPATCH;
+          case ActionPurpose::NONE:
+          default:
+            return State::PAUSED;
+        }
+      };
+
+    auto active_state =
+      [purpose]() -> State {
+        switch (purpose) {
+          case ActionPurpose::MISSION:
+            return State::MISSION_ACTIVE;
+          case ActionPurpose::VERTICAL_ELEVATE:
+            return State::VERTICAL_ELEVATE_ACTIVE;
+          case ActionPurpose::VERTICAL_DESCEND:
+            return State::VERTICAL_DESCEND_ACTIVE;
+          case ActionPurpose::RETURN_TO_LANDING:
+            return State::RETURN_ACTIVE;
+          case ActionPurpose::NONE:
+          default:
+            return State::PAUSED;
+        }
+      };
+
+    rclcpp_action::Client<
+      FollowWaypoints>::
+      SendGoalOptions options;
+
     options.goal_response_callback =
-      [this, purpose, trajectory_id](const GoalHandleFollowWaypoints::SharedPtr goal_handle) {
+      [this,
+        purpose,
+        trajectory_id,
+        dispatch_state,
+        active_state](
+        const GoalHandleFollowWaypoints::
+        SharedPtr goal_handle)
+      {
         if (!goal_handle) {
           RCLCPP_DEBUG(
-            get_logger(), "[/%s] %s action rejected; controller may still be in TAKEOFF, retrying",
-            drone_namespace_.c_str(), purpose == ActionPurpose::MISSION ? "MISSION" : "RETURN");
-          state_ = purpose == ActionPurpose::MISSION ? State::MISSION_DISPATCH : State::RETURN_DISPATCH;
-          action_purpose_ = ActionPurpose::NONE;
-          next_attempt_at_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(retry_period_ms_);
+            get_logger(),
+            "[/%s] %s action rejected; controller may not be in HOLD yet, retrying",
+            drone_namespace_.c_str(),
+            purpose ==
+            ActionPurpose::MISSION ?
+            "MISSION" :
+            purpose ==
+            ActionPurpose::VERTICAL_ELEVATE ?
+            "ELEVATE" :
+            purpose ==
+            ActionPurpose::VERTICAL_DESCEND ?
+            "DESCEND" :
+            "RETURN");
+
+          state_ =
+            dispatch_state();
+
+          action_purpose_ =
+            ActionPurpose::NONE;
+
+          next_attempt_at_ =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+            retry_period_ms_);
+
           return;
         }
-        active_goal_handle_ = goal_handle;
-        deviation_active_ = false;
-        mission_started_at_ = std::chrono::steady_clock::now();
-        state_ = purpose == ActionPurpose::MISSION ? State::MISSION_ACTIVE : State::RETURN_ACTIVE;
+
+        active_goal_handle_ =
+          goal_handle;
+
+        deviation_active_ =
+          false;
+
+        mission_started_at_ =
+          std::chrono::steady_clock::now();
+
+        state_ =
+          active_state();
+
         if (purpose == ActionPurpose::MISSION) {
           RCLCPP_INFO(
             get_logger(),
@@ -1348,9 +1850,28 @@ private:
             action_repetition_,
             action_mission_index_,
             active_trajectory_ ?
-            active_trajectory_->mission.size() :
+            active_trajectory_->
+            mission.size() :
             0U,
             action_base_index_);
+        } else if (
+          purpose ==
+          ActionPurpose::VERTICAL_ELEVATE ||
+          purpose ==
+          ActionPurpose::VERTICAL_DESCEND)
+        {
+          RCLCPP_INFO(
+            get_logger(),
+            "[/%s] %s auxiliary action accepted | mission remains paused | "
+            "repetition=%u mission=%zu waypoint=%zu",
+            drone_namespace_.c_str(),
+            purpose ==
+            ActionPurpose::VERTICAL_ELEVATE ?
+            "ELEVATE" :
+            "DESCEND",
+            current_repetition_,
+            current_mission_index_,
+            current_mission_waypoint_);
         } else {
           RCLCPP_INFO(
             get_logger(),
@@ -1361,43 +1882,109 @@ private:
       };
 
     options.feedback_callback =
-      [this](const GoalHandleFollowWaypoints::SharedPtr,
-        const std::shared_ptr<const FollowWaypoints::Feedback> feedback) {
+      [this](
+        const GoalHandleFollowWaypoints::
+        SharedPtr,
+        const std::shared_ptr<
+        const FollowWaypoints::Feedback>
+        feedback)
+      {
         if (!feedback) {
           return;
         }
-        if (action_purpose_ == ActionPurpose::MISSION &&
-          (state_ == State::MISSION_ACTIVE || state_ == State::PAUSE_CANCELING || state_ == State::STOP_CANCELING))
+
+        if (
+          action_purpose_ ==
+          ActionPurpose::MISSION &&
+          (
+            state_ ==
+            State::MISSION_ACTIVE ||
+            state_ ==
+            State::PAUSE_CANCELING ||
+            state_ ==
+            State::STOP_CANCELING))
         {
-          process_mission_feedback(*feedback);
+          process_mission_feedback(
+            *feedback);
         }
       };
 
     options.result_callback =
-      [this, purpose, trajectory_id](const GoalHandleFollowWaypoints::WrappedResult & result) {
+      [this,
+        purpose,
+        trajectory_id](
+        const GoalHandleFollowWaypoints::
+        WrappedResult & result)
+      {
         active_goal_handle_.reset();
-        cancel_request_in_flight_ = false;
+        cancel_request_in_flight_ =
+          false;
 
-        if (result.code == rclcpp_action::ResultCode::CANCELED) {
-          const CancelIntent intent = cancel_intent_;
-          cancel_intent_ = CancelIntent::NONE;
-          action_purpose_ = ActionPurpose::NONE;
-          deviation_active_ = false;
+        if (
+          result.code ==
+          rclcpp_action::ResultCode::CANCELED)
+        {
+          const CancelIntent intent =
+            cancel_intent_;
 
-          if (intent == CancelIntent::PAUSE) {
-            pending_pause_request_ = false;
+          cancel_intent_ =
+            CancelIntent::NONE;
 
-            if (resume_after_pause_) {
-              resume_after_pause_ = false;
-              state_ = State::MISSION_DISPATCH;
-              next_attempt_at_ = std::chrono::steady_clock::now();
+          action_purpose_ =
+            ActionPurpose::NONE;
+
+          deviation_active_ =
+            false;
+
+          if (
+            intent ==
+            CancelIntent::PAUSE &&
+            purpose ==
+            ActionPurpose::MISSION)
+          {
+            pending_pause_request_ =
+              false;
+
+            if (
+              pending_vertical_intent_ ==
+              VerticalIntent::ELEVATE)
+            {
+              pending_vertical_intent_ =
+                VerticalIntent::NONE;
+
+              state_ =
+                State::VERTICAL_ELEVATE_DISPATCH;
+
+              next_attempt_at_ =
+                std::chrono::steady_clock::now();
+
+              RCLCPP_INFO(
+                get_logger(),
+                "[/%s] Mission PAUSE completed; queued ELEVATE will now be dispatched | "
+                "repetition=%u mission=%zu waypoint=%zu",
+                drone_namespace_.c_str(),
+                current_repetition_,
+                current_mission_index_,
+                current_mission_waypoint_);
+            } else if (resume_after_pause_) {
+              resume_after_pause_ =
+                false;
+
+              state_ =
+                State::MISSION_DISPATCH;
+
+              next_attempt_at_ =
+                std::chrono::steady_clock::now();
+
               RCLCPP_INFO(
                 get_logger(),
                 "[/%s] PAUSE cancellation completed but RESUME was queued; "
                 "remaining mission will be dispatched immediately",
                 drone_namespace_.c_str());
             } else {
-              state_ = State::PAUSED;
+              state_ =
+                State::PAUSED;
+
               RCLCPP_INFO(
                 get_logger(),
                 "[/%s] Mission PAUSED | repetition=%u | mission=%zu | waypoint=%zu; "
@@ -1407,22 +1994,87 @@ private:
                 current_mission_index_,
                 current_mission_waypoint_);
             }
+
             return;
           }
 
-          state_ = State::RETURN_DISPATCH;
-          pending_stop_request_ = false;
-          next_attempt_at_ = std::chrono::steady_clock::now();
-          RCLCPP_WARN(
-            get_logger(), "[/%s] Mission canceled for TOTAL STOP; returning to landing point",
-            drone_namespace_.c_str());
+          if (
+            intent ==
+            CancelIntent::STOP)
+          {
+            pending_vertical_intent_ =
+              VerticalIntent::NONE;
+
+            resume_after_vertical_ =
+              false;
+
+            state_ =
+              State::RETURN_DISPATCH;
+
+            pending_stop_request_ =
+              false;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now();
+
+            RCLCPP_WARN(
+              get_logger(),
+              "[/%s] Active action canceled for TOTAL STOP; returning to landing point",
+              drone_namespace_.c_str());
+
+            return;
+          }
+
+          // Unexpected cancellation of a vertical auxiliary action: keep the
+          // mission paused and retry the same vertical command.
+          if (
+            purpose ==
+            ActionPurpose::VERTICAL_ELEVATE)
+          {
+            state_ =
+              State::VERTICAL_ELEVATE_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(
+              retry_period_ms_);
+
+            return;
+          }
+
+          if (
+            purpose ==
+            ActionPurpose::VERTICAL_DESCEND)
+          {
+            state_ =
+              State::VERTICAL_DESCEND_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(
+              retry_period_ms_);
+
+            return;
+          }
+
+          state_ =
+            State::RETURN_DISPATCH;
+          next_attempt_at_ =
+            std::chrono::steady_clock::now();
           return;
         }
 
-        const bool success = result.code == rclcpp_action::ResultCode::SUCCEEDED &&
-          result.result && result.result->success;
-        action_purpose_ = ActionPurpose::NONE;
-        deviation_active_ = false;
+        const bool success =
+          result.code ==
+          rclcpp_action::ResultCode::SUCCEEDED &&
+          result.result &&
+          result.result->success;
+
+        action_purpose_ =
+          ActionPurpose::NONE;
+
+        deviation_active_ =
+          false;
 
         if (purpose == ActionPurpose::MISSION) {
           if (success) {
@@ -1431,11 +2083,14 @@ private:
 
             const uint32_t completed_repetition =
               current_repetition_;
+
             const std::size_t completed_mission =
               current_mission_index_;
 
             if (advance_to_next_mission_component()) {
-              state_ = State::MISSION_DISPATCH;
+              state_ =
+                State::MISSION_DISPATCH;
+
               next_attempt_at_ =
                 std::chrono::steady_clock::now();
 
@@ -1450,7 +2105,9 @@ private:
                 current_repetition_,
                 current_mission_index_);
             } else {
-              state_ = State::LANDING_REQUEST;
+              state_ =
+                State::LANDING_REQUEST;
+
               next_attempt_at_ =
                 std::chrono::steady_clock::now();
 
@@ -1461,33 +2118,174 @@ private:
                 drone_namespace_.c_str(),
                 trajectory_id.c_str(),
                 active_trajectory_ ?
-                active_trajectory_->repetitions :
+                active_trajectory_->
+                repetitions :
                 0U,
                 active_trajectory_ ?
-                active_trajectory_->mission.size() :
+                active_trajectory_->
+                mission.size() :
                 0U);
             }
           } else {
-            pending_stop_request_ = false;
-            state_ = State::RETURN_DISPATCH;
-            next_attempt_at_ = std::chrono::steady_clock::now();
+            pending_stop_request_ =
+              false;
+
+            state_ =
+              State::RETURN_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now();
+
             RCLCPP_ERROR(
-              get_logger(), "[/%s] Mission action failed; executing return-and-land safety sequence",
+              get_logger(),
+              "[/%s] Mission action failed; executing return-and-land safety sequence",
               drone_namespace_.c_str());
           }
+
           return;
         }
 
-        state_ = State::LANDING_REQUEST;
-        next_attempt_at_ = std::chrono::steady_clock::now();
+        if (
+          purpose ==
+          ActionPurpose::VERTICAL_ELEVATE)
+        {
+          if (!success) {
+            RCLCPP_WARN(
+              get_logger(),
+              "[/%s] ELEVATE auxiliary action did not complete successfully; retrying while mission remains PAUSED",
+              drone_namespace_.c_str());
+
+            state_ =
+              State::VERTICAL_ELEVATE_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(
+              retry_period_ms_);
+
+            return;
+          }
+
+          vertical_elevated_ =
+            true;
+
+          RCLCPP_INFO(
+            get_logger(),
+            "[/%s] ELEVATE completed | reference_z=%.3f | elevated_z=%.3f | "
+            "mission cursor preserved repetition=%u mission=%zu waypoint=%zu",
+            drone_namespace_.c_str(),
+            vertical_reference_map_ ?
+            vertical_reference_map_->z :
+            std::numeric_limits<double>::quiet_NaN(),
+            vertical_reference_map_ ?
+            vertical_reference_map_->z +
+            vertical_grid_step_m_ :
+            std::numeric_limits<double>::quiet_NaN(),
+            current_repetition_,
+            current_mission_index_,
+            current_mission_waypoint_);
+
+          if (
+            pending_vertical_intent_ ==
+            VerticalIntent::DESCEND)
+          {
+            pending_vertical_intent_ =
+              VerticalIntent::NONE;
+
+            state_ =
+              State::VERTICAL_DESCEND_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now();
+          } else {
+            state_ =
+              State::PAUSED;
+          }
+
+          return;
+        }
+
+        if (
+          purpose ==
+          ActionPurpose::VERTICAL_DESCEND)
+        {
+          if (!success) {
+            RCLCPP_WARN(
+              get_logger(),
+              "[/%s] DESCEND auxiliary action did not complete successfully; retrying while mission remains PAUSED",
+              drone_namespace_.c_str());
+
+            state_ =
+              State::VERTICAL_DESCEND_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(
+              retry_period_ms_);
+
+            return;
+          }
+
+          RCLCPP_INFO(
+            get_logger(),
+            "[/%s] DESCEND completed | restored_z=%.3f | "
+            "mission cursor preserved repetition=%u mission=%zu waypoint=%zu",
+            drone_namespace_.c_str(),
+            vertical_reference_map_ ?
+            vertical_reference_map_->z :
+            std::numeric_limits<double>::quiet_NaN(),
+            current_repetition_,
+            current_mission_index_,
+            current_mission_waypoint_);
+
+          vertical_elevated_ =
+            false;
+
+          vertical_reference_map_.reset();
+
+          pending_vertical_intent_ =
+            VerticalIntent::NONE;
+
+          if (resume_after_vertical_) {
+            resume_after_vertical_ =
+              false;
+
+            state_ =
+              State::MISSION_DISPATCH;
+
+            next_attempt_at_ =
+              std::chrono::steady_clock::now();
+
+            RCLCPP_INFO(
+              get_logger(),
+              "[/%s] Queued RESUME released after DESCEND; remaining mission will be dispatched",
+              drone_namespace_.c_str());
+          } else {
+            state_ =
+              State::PAUSED;
+          }
+
+          return;
+        }
+
+        state_ =
+          State::LANDING_REQUEST;
+
+        next_attempt_at_ =
+          std::chrono::steady_clock::now();
+
         if (!success) {
           RCLCPP_ERROR(
-            get_logger(), "[/%s] Return-to-landing action failed; landing endpoint command will still be attempted",
+            get_logger(),
+            "[/%s] Return-to-landing action failed; landing endpoint command will still be attempted",
             drone_namespace_.c_str());
         }
       };
 
-    follow_waypoints_client_->async_send_goal(goal, options);
+    follow_waypoints_client_->
+    async_send_goal(
+      goal,
+      options);
   }
 
   void process_pending_commands()
@@ -1512,8 +2310,11 @@ private:
 
       if (
         active_goal_handle_ &&
-        (state_ == State::MISSION_ACTIVE ||
-        state_ == State::RETURN_ACTIVE))
+        (
+          state_ == State::MISSION_ACTIVE ||
+          state_ == State::VERTICAL_ELEVATE_ACTIVE ||
+          state_ == State::VERTICAL_DESCEND_ACTIVE ||
+          state_ == State::RETURN_ACTIVE))
       {
         request_goal_cancellation(
           CancelIntent::STOP);
@@ -1522,11 +2323,16 @@ private:
 
       if (
         state_ == State::PAUSED ||
-        state_ == State::MISSION_DISPATCH)
+        state_ == State::MISSION_DISPATCH ||
+        state_ == State::VERTICAL_ELEVATE_DISPATCH ||
+        state_ == State::VERTICAL_DESCEND_DISPATCH)
       {
         pending_stop_request_ = false;
         pending_pause_request_ = false;
+        pending_vertical_intent_ =
+          VerticalIntent::NONE;
         resume_after_pause_ = false;
+        resume_after_vertical_ = false;
         state_ =
           State::RETURN_DISPATCH;
 
@@ -1577,6 +2383,8 @@ private:
       case State::PAUSED_BEFORE_START:
       case State::PAUSE_CANCELING:
       case State::PAUSED:
+      case State::VERTICAL_ELEVATE_ACTIVE:
+      case State::VERTICAL_DESCEND_ACTIVE:
       case State::STOP_CANCELING:
       case State::MISSION_ACTIVE:
       case State::RETURN_ACTIVE:
@@ -1638,6 +2446,20 @@ private:
         }
         return;
 
+      case State::VERTICAL_ELEVATE_DISPATCH:
+        if (steady_now >= next_attempt_at_) {
+          send_action(
+            ActionPurpose::VERTICAL_ELEVATE);
+        }
+        return;
+
+      case State::VERTICAL_DESCEND_DISPATCH:
+        if (steady_now >= next_attempt_at_) {
+          send_action(
+            ActionPurpose::VERTICAL_DESCEND);
+        }
+        return;
+
       case State::RETURN_DISPATCH:
         if (steady_now >= next_attempt_at_) {
           send_action(ActionPurpose::RETURN_TO_LANDING);
@@ -1691,10 +2513,17 @@ private:
     action_repetition_ = 0U;
     action_purpose_ = ActionPurpose::NONE;
     cancel_intent_ = CancelIntent::NONE;
+    pending_vertical_intent_ =
+      VerticalIntent::NONE;
     pending_pause_request_ = false;
     pending_stop_request_ = false;
     resume_after_pause_ = false;
+    resume_after_vertical_ = false;
     supervision_start_delay_authorized_ = false;
+    vertical_elevated_ = false;
+    vertical_reference_map_.reset();
+    last_feedback_odom_.reset();
+    last_feedback_map_.reset();
     deviation_active_ = false;
     state_ = State::WAITING_TRAJECTORY;
   }
@@ -1711,6 +2540,10 @@ private:
       case State::MISSION_ACTIVE: return "MISSION_ACTIVE";
       case State::PAUSE_CANCELING: return "PAUSE_CANCELING";
       case State::PAUSED: return "PAUSED";
+      case State::VERTICAL_ELEVATE_DISPATCH: return "VERTICAL_ELEVATE_DISPATCH";
+      case State::VERTICAL_ELEVATE_ACTIVE: return "VERTICAL_ELEVATE_ACTIVE";
+      case State::VERTICAL_DESCEND_DISPATCH: return "VERTICAL_DESCEND_DISPATCH";
+      case State::VERTICAL_DESCEND_ACTIVE: return "VERTICAL_DESCEND_ACTIVE";
       case State::STOP_CANCELING: return "STOP_CANCELING";
       case State::RETURN_DISPATCH: return "RETURN_DISPATCH";
       case State::RETURN_ACTIVE: return "RETURN_ACTIVE";
@@ -1743,12 +2576,14 @@ private:
   int max_completed_keys_{128};
   double max_start_lateness_s_{5.0};
   double transform_timeout_s_{0.20};
+  double vertical_grid_step_m_{1.0};
   double max_path_deviation_m_{1.0};
   double deviation_grace_period_s_{1.0};
   double deviation_hold_time_s_{0.75};
 
   State state_{State::WAITING_TRAJECTORY};
   ActionPurpose action_purpose_{ActionPurpose::NONE};
+  VerticalIntent pending_vertical_intent_{VerticalIntent::NONE};
   CancelIntent cancel_intent_{CancelIntent::NONE};
 
   std::optional<StaticTrajectory> active_trajectory_;
@@ -1774,9 +2609,19 @@ private:
   bool pending_pause_request_{false};
   bool pending_stop_request_{false};
   bool resume_after_pause_{false};
+  bool resume_after_vertical_{false};
   bool supervision_start_delay_authorized_{false};
   bool preemptive_pause_latch_{false};
   bool cancel_request_in_flight_{false};
+
+  // Supervision vertical maneuver state. The reference is the real vehicle
+  // pose captured from mission feedback in the trajectory/map frame before
+  // ELEVATE. Mission indices are never modified by ELEVATE/DESCEND.
+  bool vertical_elevated_{false};
+  std::optional<Point3> vertical_reference_map_;
+  std::optional<Point3> last_feedback_odom_;
+  std::optional<Point3> last_feedback_map_;
+
   bool deviation_active_{false};
   double last_path_deviation_m_{0.0};
   std::chrono::steady_clock::time_point deviation_started_at_{};

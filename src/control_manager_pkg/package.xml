@@ -1,13 +1,12 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>control_manager_pkg</name>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
 
   <description>
     Per-UAS ROS 2 Humble control manager adapted to multi-mission
-    StaticTrajectory messages. Executes each mission component independently,
-    preserves pause/resume progress and supports a distinct scalar height per
-    mission component.
+    StaticTrajectory messages and the A-space vertical deconfliction workflow.
+    Preserves mission progress across PAUSE, ELEVATE, DESCEND and RESUME.
   </description>
 
   <maintainer email="maintainer@example.com">A-space</maintainer>
