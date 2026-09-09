@@ -12,6 +12,8 @@ ros2 launch deconfliction_manager deconfliction_manager.launch.py
 
 ros2 launch supervision_trajectory_manager supervision_trajectory_manager.launch.py
 
+ros2 launch distance_control distance_control.launch.py
+
 ros2 launch trajectory_server_pkg trajectory_server.launch.py
 
 ros2 launch trajectory_endtime_adjustment trajectory_endtime_adjustment.launch.py
@@ -22,3 +24,10 @@ ros2 launch flight_zone_supervision supervision_node.launch.py flight_zone_id:=i
 ros2 launch uas_control_system_bringup_pkg uas_control_system_bringup.launch.py ua_id:=ua_ins_1 flight_zone_id:=inspection_1
 
 ros2 launch uas_control_system_bringup_pkg uas_control_system_bringup.launch.py ua_id:=ua_ins_2 flight_zone_id:=inspection_1
+
+
+
+
+ros2 bag record /inspection_1_ua_ins_1/fmu/out/vehicle_odometry /inspection_1_ua_ins_2/fmu/out/vehicle_odometry /inspection_1/ua_ins_1/odom /inspection_1/ua_ins_2/odom /inspection_1/ua_ins_1/zone_status /inspection_1/ua_ins_2/zone_status -o test_4
+
+
