@@ -28,7 +28,7 @@ class ASpaceMongoMacroIngestor(Node):
         super().__init__("a_space_mongo_macro_ingestor")
 
         #self.declare_parameter("mongo_uri", "mongodb://localhost:27017/")
-        self.declare_parameter("mongo_uri", "mongodb+srv://rinese:1slhXUAFTvVuJOqb@uas-telemetry.gxsmyxv.mongodb.net/?appName=uas-telemetry")
+        self.declare_parameter("mongo_uri", "")
         self.declare_parameter("db_name", "uas-telemetry")
         self.declare_parameter("collection_name", "macro_topics")
         self.declare_parameter("drone_id", "drone_01")
